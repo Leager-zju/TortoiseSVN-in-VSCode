@@ -1,4 +1,4 @@
-# TortoiseSVN 基础集成
+# SVNHelper
 
 面向 Windows 与 TortoiseSVN 的 VS Code 扩展，提供：
 

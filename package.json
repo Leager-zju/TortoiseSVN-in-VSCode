@@ -1,9 +1,9 @@
 {
-  "name": "tortoisesvn-basic",
-  "displayName": "TortoiseSVN 基础集成",
+  "name": "svnhelper",
+  "displayName": "SVNHelper",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
   "version": "0.1.0",
-  "publisher": "local",
+  "publisher": "leager",
   "engines": {
     "vscode": "^1.96.0"
   },
