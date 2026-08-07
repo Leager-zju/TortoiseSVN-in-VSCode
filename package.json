@@ -1,0 +1,185 @@
+{
+  "name": "tortoisesvn-basic",
+  "displayName": "TortoiseSVN 基础集成",
+  "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "SCM Providers"
+  ],
+  "keywords": [
+    "svn",
+    "subversion",
+    "tortoisesvn",
+    "scm"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "svn.update",
+        "title": "SVN 更新",
+        "category": "SVN",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "svn.commit",
+        "title": "SVN 提交",
+        "category": "SVN",
+        "icon": "$(check)"
+      },
+      {
+        "command": "svn.revert",
+        "title": "SVN 回退",
+        "category": "SVN",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "svn.diff",
+        "title": "SVN Diff",
+        "category": "SVN",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "svn.add",
+        "title": "SVN 加入版本管理",
+        "category": "SVN",
+        "icon": "$(add)"
+      },
+      {
+        "command": "svn.refresh",
+        "title": "刷新 SVN 状态",
+        "category": "SVN",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "svn.update",
+          "when": "resourceScheme == file && isWindows",
+          "group": "svn@1"
+        },
+        {
+          "command": "svn.commit",
+          "when": "resourceScheme == file && isWindows",
+          "group": "svn@2"
+        },
+        {
+          "command": "svn.revert",
+          "when": "resourceScheme == file && isWindows",
+          "group": "svn@3"
+        },
+        {
+          "command": "svn.diff",
+          "when": "resourceScheme == file",
+          "group": "svn@4"
+        },
+        {
+          "command": "svn.add",
+          "when": "resourceScheme == file && isWindows",
+          "group": "svn@5"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "svn.update",
+          "when": "resourceScheme == file && isWindows",
+          "group": "svn@1"
+        },
+        {
+          "command": "svn.commit",
+          "when": "resourceScheme == file && isWindows",
+          "group": "svn@2"
+        },
+        {
+          "command": "svn.revert",
+          "when": "resourceScheme == file && isWindows",
+          "group": "svn@3"
+        },
+        {
+          "command": "svn.diff",
+          "when": "resourceScheme == file",
+          "group": "svn@4"
+        },
+        {
+          "command": "svn.add",
+          "when": "resourceScheme == file && isWindows",
+          "group": "svn@5"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "svn.refresh",
+          "when": "scmProvider == svn",
+          "group": "navigation"
+        }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "svn.diff",
+          "when": "scmProvider == svn",
+          "group": "inline"
+        },
+        {
+          "command": "svn.revert",
+          "when": "scmProvider == svn && isWindows",
+          "group": "navigation@1"
+        },
+        {
+          "command": "svn.commit",
+          "when": "scmProvider == svn && isWindows",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "SVN",
+      "properties": {
+        "svn.path": {
+          "type": "string",
+          "default": "svn.exe",
+          "description": "svn.exe 路径。默认从 PATH 查找。"
+        },
+        "svn.tortoiseProc.path": {
+          "type": "string",
+          "default": "TortoiseProc.exe",
+          "description": "TortoiseProc.exe 路径。默认从 PATH 查找。"
+        },
+        "svn.autoRefresh": {
+          "type": "boolean",
+          "default": true,
+          "description": "自动刷新资源管理器和源代码管理侧栏中的 SVN 状态。"
+        },
+        "svn.refreshInterval": {
+          "type": "number",
+          "default": 3000,
+          "minimum": 1000,
+          "description": "自动刷新间隔（毫秒）。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "npm run typecheck && node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "npm run compile && vsce package"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.96.0",
+    "@vscode/vsce": "^3.7.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
+  }
+}
