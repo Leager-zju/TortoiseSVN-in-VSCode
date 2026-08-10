@@ -10,6 +10,45 @@ export interface SvnStatusEntry {
   revision?: string;
 }
 
+export interface SvnLogChangedPath {
+  path: string;
+  action: string;
+  kind?: string;
+  textModified?: string;
+  propsModified?: string;
+  copyFromPath?: string;
+  copyFromRevision?: string;
+}
+
+export interface SvnLogEntry {
+  revision: number;
+  author: string;
+  date: string;
+  message: string;
+  changedPaths: SvnLogChangedPath[];
+}
+
+export interface SvnLogPage {
+  entries: SvnLogEntry[];
+  hasMore: boolean;
+  nextRevision?: number;
+}
+
+export interface SvnTargetInfo {
+  url: string;
+  repositoryRoot: string;
+  relativeUrl: string;
+  kind: 'file' | 'dir';
+  revision?: string;
+}
+
+export interface SvnBlameLine {
+  lineNumber: number;
+  revision?: number;
+  author: string;
+  date: string;
+}
+
 function asArray<T>(value: T|T[]|undefined): T[] {
   if (value === undefined) {
     return [];
@@ -27,11 +66,11 @@ function tortoiseExecutable(): string {
       'tortoiseProc.path', 'TortoiseProc.exe');
 }
 
-export function runSvn(args: string[], cwd?: string): Promise<string> {
+export function runSvn(args: string[], cwd?: string, maxBuffer = 20 * 1024 * 1024): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
         svnExecutable(), args,
-        {cwd, encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, windowsHide: true},
+        {cwd, encoding: 'utf8', maxBuffer, windowsHide: true},
         (error, stdout, stderr) => {
           if (error) {
             const detail = String(stderr || stdout || error.message).trim();
@@ -49,7 +88,7 @@ export async function findWorkingCopyRoot(targetPath: string):
     Promise<string|undefined> {
   try {
     const output = await runSvn(
-        ['info', '--show-item', 'wc-root', '--', targetPath],
+        ['info', '--show-item', 'wc-root', '--', withPegEscape(targetPath)],
         path.dirname(targetPath));
     const root = output.trim();
     return root || undefined;
@@ -61,7 +100,7 @@ export async function findWorkingCopyRoot(targetPath: string):
 export async function getSvnStatus(
     rootPath: string, targets: string[]): Promise<SvnStatusEntry[]> {
   const output = await runSvn(
-      ['status', '--xml', '--ignore-externals', '--', ...targets], rootPath);
+      ['status', '--xml', '--ignore-externals', '--', ...targets.map(withPegEscape)], rootPath);
   const parser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: '',
@@ -88,7 +127,7 @@ export async function getSvnStatus(
       }
       const item = status.item ?? 'none';
       const props = status.props ?? 'none';
-      if (!isCommittable(item, props)) {
+      if (!shouldExposeStatus(item, props)) {
         continue;
       }
       entries.push({
@@ -103,18 +142,184 @@ export async function getSvnStatus(
   return entries;
 }
 
-function isCommittable(item: string, props: string): boolean {
-  const excluded =
-      new Set(['none', 'normal', 'unversioned', 'ignored', 'external']);
-  return !excluded.has(item) || !excluded.has(props);
+function shouldExposeStatus(item: string, props: string): boolean {
+  if (item === 'ignored' || item === 'external') {
+    return false;
+  }
+  return item === 'unversioned' || !['none', 'normal'].includes(item) || !['none', 'normal'].includes(props);
+}
+
+export async function getSvnTargetInfo(targetPath: string): Promise<SvnTargetInfo> {
+  const output = await runSvn(['info', '--xml', '--', withPegEscape(targetPath)], path.dirname(targetPath));
+  const document = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: '',
+    parseAttributeValue: false
+  }).parse(output) as {
+    info?: {
+      entry?: {
+        kind?: string;
+        revision?: string;
+        url?: string;
+        'relative-url'?: string;
+        repository?: { root?: string };
+      };
+    };
+  };
+  const entry = document.info?.entry;
+  if (!entry?.url || !entry.repository?.root) {
+    throw new Error('无法读取该资源的 SVN 仓库信息。');
+  }
+  return {
+    url: entry.url,
+    repositoryRoot: entry.repository.root,
+    relativeUrl: entry['relative-url'] ?? '',
+    kind: entry.kind === 'dir' ? 'dir' : 'file',
+    revision: entry.revision
+  };
+}
+
+export async function getSvnLog(
+  targetPath: string,
+  startRevision?: number,
+  pageSize = 100
+): Promise<SvnLogPage> {
+  const args = [
+    'log',
+    '--xml',
+    '--verbose',
+    '--limit',
+    String(pageSize + 1),
+    '-r',
+    startRevision === undefined ? 'HEAD:1' : `${startRevision}:1`,
+    '--',
+    withPegEscape(targetPath)
+  ];
+  const output = await runSvn(args, path.dirname(targetPath));
+  const document = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: '',
+    textNodeName: '#text',
+    parseAttributeValue: false,
+    parseTagValue: false,
+    trimValues: false
+  }).parse(output) as {
+    log?: {
+      logentry?: Array<{
+        revision?: string;
+        author?: string;
+        date?: string;
+        msg?: string;
+        paths?: {
+          path?: Array<string | {
+            '#text'?: string;
+            action?: string;
+            kind?: string;
+            'text-mods'?: string;
+            'prop-mods'?: string;
+            'copyfrom-path'?: string;
+            'copyfrom-rev'?: string;
+          }>;
+        };
+      }>;
+    };
+  };
+
+  const parsed = asArray(document.log?.logentry).map(entry => ({
+    revision: Number(entry.revision ?? 0),
+    author: String(entry.author ?? ''),
+    date: String(entry.date ?? ''),
+    message: String(entry.msg ?? ''),
+    changedPaths: asArray(entry.paths?.path).map(changedPath => {
+      if (typeof changedPath === 'string') {
+        return { path: changedPath, action: '?' };
+      }
+      return {
+        path: changedPath['#text'] ?? '',
+        action: changedPath.action ?? '?',
+        kind: changedPath.kind,
+        textModified: changedPath['text-mods'],
+        propsModified: changedPath['prop-mods'],
+        copyFromPath: changedPath['copyfrom-path'],
+        copyFromRevision: changedPath['copyfrom-rev']
+      };
+    })
+  })).filter(entry => Number.isFinite(entry.revision) && entry.revision > 0);
+
+  const hasMore = parsed.length > pageSize;
+  const entries = parsed.slice(0, pageSize);
+  const lastRevision = entries.at(-1)?.revision;
+  return {
+    entries,
+    hasMore,
+    nextRevision: hasMore && lastRevision && lastRevision > 1 ? lastRevision - 1 : undefined
+  };
+}
+
+export async function getSvnBlame(filePath: string): Promise<SvnBlameLine[]> {
+  const output = await runSvn(
+    ['blame', '--xml', '--force', '--', withPegEscape(filePath)],
+    path.dirname(filePath),
+    100 * 1024 * 1024
+  );
+  const document = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: '',
+    parseAttributeValue: false,
+    parseTagValue: false,
+    trimValues: false
+  }).parse(output) as {
+    blame?: {
+      target?: {
+        entry?: Array<{
+          'line-number'?: string;
+          commit?: {
+            revision?: string;
+            author?: string;
+            date?: string;
+          };
+        }>;
+      };
+    };
+  };
+
+  return asArray(document.blame?.target?.entry).map(entry => {
+    const revision = Number(entry.commit?.revision);
+    return {
+      lineNumber: Number(entry['line-number'] ?? 0),
+      revision: Number.isFinite(revision) && revision > 0 ? revision : undefined,
+      author: String(entry.commit?.author ?? ''),
+      date: String(entry.commit?.date ?? '')
+    };
+  }).filter(entry => Number.isInteger(entry.lineNumber) && entry.lineNumber > 0);
+}
+
+export async function getRevisionContent(filePath: string, revision: number): Promise<string> {
+  return runSvn(['cat', '-r', String(revision), '--', withPegEscape(filePath)], path.dirname(filePath));
+}
+
+export async function getRevisionDiff(filePath: string, revision: number): Promise<string> {
+  return runSvn(['diff', '-c', String(revision), '--', withPegEscape(filePath)], path.dirname(filePath));
+}
+
+function withPegEscape(targetPath: string): string {
+  return `${targetPath}@`;
 }
 
 export async function getBaseContent(filePath: string): Promise<string> {
-  return runSvn(['cat', '-r', 'BASE', '--', filePath], path.dirname(filePath));
+  return runSvn(['cat', '-r', 'BASE', '--', withPegEscape(filePath)], path.dirname(filePath));
+}
+
+export async function revertSvnTargets(targets: string[]): Promise<void> {
+  if (targets.length === 0) {
+    return;
+  }
+  const cwd = path.dirname(targets[0]);
+  await runSvn(['revert', '--', ...targets.map(withPegEscape)], cwd);
 }
 
 export function launchTortoise(
-    command: 'update'|'commit'|'revert'|'add', targets: string[],
+  command: 'update'|'commit'|'add', targets: string[],
     extraArgs: string[] = []): ChildProcess {
   if (process.platform !== 'win32') {
     throw new Error('TortoiseSVN 原生窗口仅支持 Windows。');

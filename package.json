@@ -2,8 +2,17 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "leager",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Leager-zju/TortoiseSVN-in-VSCode.git"
+  },
+  "homepage": "https://github.com/Leager-zju/TortoiseSVN-in-VSCode#readme",
+  "bugs": {
+    "url": "https://github.com/Leager-zju/TortoiseSVN-in-VSCode/issues"
+  },
   "engines": {
     "vscode": "^1.96.0"
   },
@@ -33,6 +42,18 @@
         "title": "SVN 提交",
         "category": "SVN",
         "icon": "$(check)"
+      },
+      {
+        "command": "svn.log",
+        "title": "SVN 日志",
+        "category": "SVN",
+        "icon": "$(history)"
+      },
+      {
+        "command": "svn.selectionHistory",
+        "title": "查看选中内容 SVN 历史",
+        "category": "SVN",
+        "icon": "$(git-commit)"
       },
       {
         "command": "svn.revert",
@@ -72,19 +93,24 @@
           "group": "svn@2"
         },
         {
-          "command": "svn.revert",
-          "when": "resourceScheme == file && isWindows",
+          "command": "svn.log",
+          "when": "resourceScheme == file",
           "group": "svn@3"
         },
         {
-          "command": "svn.diff",
-          "when": "resourceScheme == file",
+          "command": "svn.revert",
+          "when": "resourceScheme == file && isWindows && resourcePath in svn.changedResourcePaths",
           "group": "svn@4"
         },
         {
-          "command": "svn.add",
-          "when": "resourceScheme == file && isWindows",
+          "command": "svn.diff",
+          "when": "resourceScheme == file && resourcePath in svn.changedResourcePaths",
           "group": "svn@5"
+        },
+        {
+          "command": "svn.add",
+          "when": "resourceScheme == file && isWindows && resourcePath in svn.unversionedResourcePaths",
+          "group": "svn@6"
         }
       ],
       "editor/context": [
@@ -99,19 +125,29 @@
           "group": "svn@2"
         },
         {
-          "command": "svn.revert",
-          "when": "resourceScheme == file && isWindows",
+          "command": "svn.log",
+          "when": "resourceScheme == file",
           "group": "svn@3"
         },
         {
-          "command": "svn.diff",
-          "when": "resourceScheme == file",
+          "command": "svn.selectionHistory",
+          "when": "resourceScheme == file && editorHasSelection",
+          "group": "svn@3.5"
+        },
+        {
+          "command": "svn.revert",
+          "when": "resourceScheme == file && isWindows && resourcePath in svn.changedResourcePaths",
           "group": "svn@4"
         },
         {
-          "command": "svn.add",
-          "when": "resourceScheme == file && isWindows",
+          "command": "svn.diff",
+          "when": "resourceScheme == file && resourcePath in svn.changedResourcePaths",
           "group": "svn@5"
+        },
+        {
+          "command": "svn.add",
+          "when": "resourceScheme == file && isWindows && resourcePath in svn.unversionedResourcePaths",
+          "group": "svn@6"
         }
       ],
       "scm/title": [
@@ -124,18 +160,23 @@
       "scm/resourceState/context": [
         {
           "command": "svn.diff",
-          "when": "scmProvider == svn",
-          "group": "inline"
+          "when": "scmProvider == svn && scmResourceState == svn.changed",
+          "group": "inline@1"
         },
         {
           "command": "svn.revert",
-          "when": "scmProvider == svn && isWindows",
-          "group": "navigation@1"
+          "when": "scmProvider == svn && scmResourceState == svn.changed && isWindows",
+          "group": "inline@2"
         },
         {
           "command": "svn.commit",
           "when": "scmProvider == svn && isWindows",
           "group": "navigation@2"
+        },
+        {
+          "command": "svn.log",
+          "when": "scmProvider == svn",
+          "group": "navigation@3"
         }
       ]
     },
@@ -177,7 +218,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "@types/vscode": "^1.96.0",
+    "@types/vscode": "1.96.0",
     "@vscode/vsce": "^3.7.0",
     "esbuild": "^0.25.0",
     "typescript": "^5.7.0"

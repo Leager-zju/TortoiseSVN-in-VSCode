@@ -34,6 +34,10 @@ export class SvnRepository implements vscode.Disposable, vscode.FileDecorationPr
     this.decorationRegistration = vscode.window.registerFileDecorationProvider(this);
   }
 
+  get statusEntries(): readonly SvnStatusEntry[] {
+    return [...this.statuses.values()];
+  }
+
   async refresh(): Promise<void> {
     if (this.refreshing) {
       return;
@@ -46,6 +50,7 @@ export class SvnRepository implements vscode.Disposable, vscode.FileDecorationPr
         nextStatuses.set(pathKey(entry.path), entry);
       }
       const states = [...nextStatuses.values()]
+        .filter(isVersionedChange)
         .sort((left, right) => left.path.localeCompare(right.path))
         .map(entry => this.toResourceState(entry));
       const changedDecorations = changedStatusUris(this.statuses, nextStatuses);
@@ -94,7 +99,7 @@ export class SvnRepository implements vscode.Disposable, vscode.FileDecorationPr
         title: '打开 SVN Diff',
         arguments: [uri]
       },
-      contextValue: `svn.${entry.item}`,
+      contextValue: 'svn.changed',
       decorations: {
         iconPath: new vscode.ThemeIcon(presentation.icon, new vscode.ThemeColor(presentation.color)),
         tooltip: presentation.tooltip,
@@ -102,6 +107,13 @@ export class SvnRepository implements vscode.Disposable, vscode.FileDecorationPr
       }
     };
   }
+}
+
+export function isVersionedChange(entry: SvnStatusEntry): boolean {
+  if (entry.item === 'unversioned' || entry.item === 'ignored' || entry.item === 'external') {
+    return false;
+  }
+  return !['none', 'normal'].includes(entry.item) || !['none', 'normal'].includes(entry.props);
 }
 
 function changedStatusUris(
@@ -144,6 +156,8 @@ function statusPresentation(item: string, props: string): StatusPresentation {
 
   const propertySuffix = props === 'modified' ? '（属性已更改）' : '';
   switch (item) {
+    case 'unversioned':
+      return { badge: '?', icon: 'question', tooltip: '未加入版本管理', color: 'gitDecoration.untrackedResourceForeground' };
     case 'added':
       return { badge: 'A', icon: 'diff-added', tooltip: `已添加${propertySuffix}`, color: 'gitDecoration.addedResourceForeground' };
     case 'deleted':
