@@ -238,6 +238,7 @@ class RepositoryManager implements vscode.Disposable {
     });
     register('svn.selectionHistory', first => this.showSelectionHistory(first));
     register('svn.revert', (first, selected) => this.confirmAndRevert(commandUris(first, selected)));
+    register('svn.revertChange', (uri, changes, index) => this.revertChange(uri, changes, index));
     register('svn.add', (first, selected) => this.runNative(
       'add',
       commandUris(first, selected),
@@ -374,6 +375,94 @@ class RepositoryManager implements vscode.Disposable {
     this.refreshTimer = setInterval(() => void this.refreshAll(), interval);
   }
 
+  private async revertChange(
+    uriValue: unknown,
+    changesValue: unknown,
+    indexValue: unknown
+  ): Promise<void> {
+    const uri = toUri(uriValue);
+    const changes = toLineChanges(changesValue);
+    const index = Number(indexValue);
+    if (!uri || uri.scheme !== 'file' || !changes ||
+        !Number.isInteger(index) || index < 0 || index >= changes.length) {
+      void vscode.window.showWarningMessage('无法确定要回退的 SVN 差异，请重新打开快速差异后重试。');
+      return;
+    }
+
+    const editor = vscode.window.visibleTextEditors.find(
+      value => value.document.uri.toString() === uri.toString());
+    if (!editor) {
+      void vscode.window.showWarningMessage('请保持对应文件可见后再回退此差异。');
+      return;
+    }
+
+    const status = this.statusFor(uri);
+    if (!status || !['added', 'deleted', 'missing', 'modified', 'replaced'].includes(status.item) ||
+        status.props === 'conflicted') {
+      void vscode.window.showInformationMessage('该文件当前状态不支持安全地回退单个差异。');
+      return;
+    }
+    const document = editor.document;
+    if (document.isDirty) {
+      void vscode.window.showWarningMessage('请先保存文件，再回退快速差异。这样可以避免覆盖其他未保存的编辑。');
+      return;
+    }
+    const documentVersion = document.version;
+    const choice = await vscode.window.showWarningMessage(
+      `是否回退“${path.basename(uri.fsPath)}”中的当前差异？其他本地更改将保留。`,
+      {modal: true},
+      '回退此差异'
+    );
+    if (choice !== '回退此差异') {
+      return;
+    }
+    if (document.version !== documentVersion) {
+      void vscode.window.showWarningMessage('文件内容已变化，请重新打开快速差异后再回退。');
+      return;
+    }
+
+    try {
+      const baseContent = status.item === 'added' ? '' :
+        await getBaseContent(uri.fsPath);
+      const original = await vscode.workspace.openTextDocument({
+        content: baseContent,
+        language: document.languageId
+      });
+      if (document.version !== documentVersion || document.isDirty) {
+        void vscode.window.showWarningMessage('文件内容已变化，请重新打开快速差异后再回退。');
+        return;
+      }
+      const originalContent = original.getText();
+      if (originalContent.includes('\uFFFD')) {
+        void vscode.window.showWarningMessage('SVN BASE 内容可能不是 UTF-8 编码，已取消回退以避免损坏文件。');
+        return;
+      }
+      if (normalizeEol(applyLineChanges(original, document, changes)) !==
+          normalizeEol(document.getText())) {
+        void vscode.window.showWarningMessage('快速差异已过期，请关闭弹窗并重新打开后再回退。');
+        return;
+      }
+      const remainingChanges = changes.filter((_, changeIndex) => changeIndex !== index);
+      const content = applyLineChanges(original, document, remainingChanges);
+      const lastLine = document.lineAt(document.lineCount - 1);
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(
+        uri,
+        new vscode.Range(0, 0, document.lineCount - 1, lastLine.range.end.character),
+        content
+      );
+      if (!await vscode.workspace.applyEdit(edit)) {
+        throw new Error('VS Code 未能应用文件编辑。');
+      }
+      if (!await document.save()) {
+        throw new Error('文件保存失败。');
+      }
+      await this.refreshAll(true);
+    } catch (error) {
+      void vscode.window.showErrorMessage(`SVN 差异回退失败：${errorMessage(error)}`);
+    }
+  }
+
   private async confirmAndRevert(uris: vscode.Uri[]): Promise<void> {
     const resources = uris.filter(uri => uri.scheme === 'file');
     if (resources.length === 0) {
@@ -472,6 +561,84 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 }
 
 export function deactivate(): void {}
+
+type LineChange = {
+  originalStartLineNumber: number;
+  originalEndLineNumber: number;
+  modifiedStartLineNumber: number;
+  modifiedEndLineNumber: number;
+};
+
+function toLineChanges(value: unknown): LineChange[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const changes: LineChange[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') {
+      return undefined;
+    }
+    const candidate = item as Record<keyof LineChange, unknown>;
+    const change = {
+      originalStartLineNumber: Number(candidate.originalStartLineNumber),
+      originalEndLineNumber: Number(candidate.originalEndLineNumber),
+      modifiedStartLineNumber: Number(candidate.modifiedStartLineNumber),
+      modifiedEndLineNumber: Number(candidate.modifiedEndLineNumber)
+    };
+    if (!Object.values(change).every(
+      line => Number.isInteger(line) && line >= 0)) {
+      return undefined;
+    }
+    changes.push(change);
+  }
+  return changes;
+}
+
+function normalizeEol(value: string): string {
+  return value.replace(/\r\n/g, '\n');
+}
+
+function applyLineChanges(
+  original: vscode.TextDocument,
+  modified: vscode.TextDocument,
+  changes: readonly LineChange[]
+): string {
+  const result: string[] = [];
+  let currentLine = 0;
+
+  for (const change of changes) {
+    const isInsertion = change.originalEndLineNumber === 0;
+    const isDeletion = change.modifiedEndLineNumber === 0;
+    let endLine = isInsertion ?
+      change.originalStartLineNumber : change.originalStartLineNumber - 1;
+    let endCharacter = 0;
+
+    if (isDeletion && change.originalEndLineNumber === original.lineCount) {
+      endLine -= 1;
+      endCharacter = original.lineAt(endLine).range.end.character;
+    }
+    result.push(original.getText(
+      new vscode.Range(currentLine, 0, endLine, endCharacter)));
+
+    if (!isDeletion) {
+      let fromLine = change.modifiedStartLineNumber - 1;
+      let fromCharacter = 0;
+      if (isInsertion &&
+          change.originalStartLineNumber === original.lineCount) {
+        fromLine -= 1;
+        fromCharacter = modified.lineAt(fromLine).range.end.character;
+      }
+      result.push(modified.getText(new vscode.Range(
+        fromLine, fromCharacter, change.modifiedEndLineNumber, 0)));
+    }
+    currentLine = isInsertion ?
+      change.originalStartLineNumber : change.originalEndLineNumber;
+  }
+
+  result.push(original.getText(
+    new vscode.Range(currentLine, 0, original.lineCount, 0)));
+  return result.join('');
+}
 
 function commandUris(first: unknown, selected: unknown): vscode.Uri[] {
   const values = [first, ...(Array.isArray(selected) ? selected : [])];

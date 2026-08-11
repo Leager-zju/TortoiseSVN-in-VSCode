@@ -2,7 +2,7 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "leager",
   "license": "MIT",
   "repository": {
@@ -58,6 +58,12 @@
       {
         "command": "svn.revert",
         "title": "SVN 回退",
+        "category": "SVN",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "svn.revertChange",
+        "title": "回退此差异",
         "category": "SVN",
         "icon": "$(discard)"
       },
@@ -155,6 +161,19 @@
           "command": "svn.refresh",
           "when": "scmProvider == svn",
           "group": "navigation"
+        }
+      ],
+      "scm/change/title": [
+        {
+          "command": "svn.revertChange",
+          "when": "scmProvider == svn",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "svn.revertChange",
+          "when": "false"
         }
       ],
       "scm/resourceState/context": [
