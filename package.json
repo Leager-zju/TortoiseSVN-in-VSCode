@@ -166,8 +166,7 @@
       "scm/change/title": [
         {
           "command": "svn.revertChange",
-          "when": "scmProvider == svn",
-          "group": "navigation"
+          "when": "originalResource =~ /^svn-base\\:/"
         }
       ],
       "commandPalette": [
