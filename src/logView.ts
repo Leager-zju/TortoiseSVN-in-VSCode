@@ -576,11 +576,12 @@ function logHtml(webview: vscode.Webview): string {
         if (isCurrent) message.appendChild(badge('当前', 'current'));
         if (workingRevision !== undefined && entry.revision > workingRevision) message.appendChild(badge('待更新', 'pending'));
         row.appendChild(message);
-        row.addEventListener('click', event => select(entry.revision, event.ctrlKey || event.metaKey));
+        row.addEventListener('click', event => {
+          if (event.detail === 1) select(entry.revision, event.ctrlKey || event.metaKey);
+        });
         row.addEventListener('keydown', event => {
           if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(entry.revision, event.ctrlKey || event.metaKey); }
         });
-        row.addEventListener('dblclick', () => send('openRevision', { revision: entry.revision }));
         item.appendChild(row);
         if (expandedRevision === entry.revision) item.appendChild(renderDetails(entry));
         rows.appendChild(item);
@@ -603,11 +604,31 @@ function logHtml(webview: vscode.Webview): string {
     }
     function changeTree(changes) {
       const root = { children: new Map() };
-      for (const change of changes) {
-        const segments = change.path.split('/').filter(Boolean);
-        let parent = root;
-        let currentPath = '';
-        for (const segment of segments) {
+      const paths = changes.map(change => change.path.split('/').filter(Boolean));
+      let commonLength = paths[0]?.length || 0;
+      for (let index = 1; index < paths.length && commonLength > 0; index++) {
+        let matched = 0;
+        while (matched < commonLength && paths[index][matched] === paths[0][matched]) matched++;
+        commonLength = matched;
+      }
+      if (changes.length === 1 && changes[0].kind !== 'dir') {
+        commonLength = Math.max(0, commonLength - 1);
+      }
+
+      let treeRoot = root;
+      if (commonLength > 0) {
+        const commonPath = '/' + paths[0].slice(0, commonLength).join('/');
+        const commonName = (commonLength > 1 ? '…/' : '/') + paths[0][commonLength - 1];
+        treeRoot = { name: commonName, path: commonPath, children: new Map() };
+        root.children.set(commonPath, treeRoot);
+      }
+
+      for (let changeIndex = 0; changeIndex < changes.length; changeIndex++) {
+        const change = changes[changeIndex];
+        const segments = paths[changeIndex];
+        let parent = treeRoot;
+        let currentPath = commonLength > 0 ? '/' + segments.slice(0, commonLength).join('/') : '';
+        for (const segment of segments.slice(commonLength)) {
           currentPath += '/' + segment;
           if (!parent.children.has(segment)) parent.children.set(segment, { name: segment, path: currentPath, children: new Map() });
           parent = parent.children.get(segment);
