@@ -33,11 +33,17 @@ class SvnDocumentProvider implements vscode.TextDocumentContentProvider {
     }
 
     if (this.kind === 'revision') {
+      if (parameters.get('empty') === 'true') {
+        return '';
+      }
       const revision = Number(parameters.get('revision'));
-      if (!Number.isInteger(revision) || revision <= 0) {
+      const pegValue = parameters.get('pegRevision');
+      const pegRevision = pegValue === null ? undefined : Number(pegValue);
+      if (!Number.isInteger(revision) || revision <= 0 ||
+          pegRevision !== undefined && (!Number.isInteger(pegRevision) || pegRevision <= 0)) {
         throw new Error('无效的 SVN 修订号。');
       }
-      return getRevisionContent(filePath, revision);
+      return getRevisionContent(filePath, revision, pegRevision);
     }
 
     try {

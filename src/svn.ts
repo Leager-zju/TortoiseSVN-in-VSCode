@@ -294,8 +294,14 @@ export async function getSvnBlame(filePath: string): Promise<SvnBlameLine[]> {
   }).filter(entry => Number.isInteger(entry.lineNumber) && entry.lineNumber > 0);
 }
 
-export async function getRevisionContent(filePath: string, revision: number): Promise<string> {
-  return runSvn(['cat', '-r', String(revision), '--', withPegEscape(filePath)], path.dirname(filePath));
+export async function getRevisionContent(
+  target: string,
+  revision: number,
+  pegRevision?: number
+): Promise<string> {
+  const cwd = /^[a-z][a-z\d+.-]*:\/\//i.test(target) ? undefined : path.dirname(target);
+  const pegTarget = pegRevision === undefined ? withPegEscape(target) : `${target}@${pegRevision}`;
+  return runSvn(['cat', '-r', String(revision), '--', pegTarget], cwd);
 }
 
 export async function getRevisionDiff(filePath: string, revision: number): Promise<string> {
