@@ -2,7 +2,7 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publisher": "leager",
   "license": "MIT",
   "repository": {
@@ -66,6 +66,12 @@
         "title": "回退此差异",
         "category": "SVN",
         "icon": "$(discard)"
+      },
+      {
+        "command": "svn.openFile",
+        "title": "打开文件",
+        "category": "SVN",
+        "icon": "$(go-to-file)"
       },
       {
         "command": "svn.diff",
@@ -163,6 +169,13 @@
           "group": "navigation"
         }
       ],
+      "editor/title": [
+        {
+          "command": "svn.openFile",
+          "when": "isInDiffEditor && resourceScheme == svn-working",
+          "group": "navigation"
+        }
+      ],
       "scm/change/title": [
         {
           "command": "svn.revertChange",
@@ -177,14 +190,19 @@
       ],
       "scm/resourceState/context": [
         {
-          "command": "svn.diff",
+          "command": "svn.openFile",
           "when": "scmProvider == svn && scmResourceState == svn.changed",
           "group": "inline@1"
         },
         {
+          "command": "svn.diff",
+          "when": "scmProvider == svn && scmResourceState == svn.changed",
+          "group": "inline@2"
+        },
+        {
           "command": "svn.revert",
           "when": "scmProvider == svn && scmResourceState == svn.changed && isWindows",
-          "group": "inline@2"
+          "group": "inline@3"
         },
         {
           "command": "svn.commit",

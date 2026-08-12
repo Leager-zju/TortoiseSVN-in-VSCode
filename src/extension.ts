@@ -205,6 +205,29 @@ class RepositoryManager implements vscode.Disposable {
     };
 
     register('svn.refresh', () => this.refreshAll(true));
+    register('svn.openFile', async first => {
+      const source = toUri(first) ?? vscode.window.activeTextEditor?.document.uri;
+      const uri = source ? toWorkingFileUri(source) : undefined;
+      if (!uri) {
+        void vscode.window.showWarningMessage('无法确定要打开的工作副本文件。');
+        return;
+      }
+
+      try {
+        const options: vscode.TextDocumentShowOptions = {
+          preserveFocus: isSourceControlResourceState(first),
+          preview: false,
+          viewColumn: vscode.ViewColumn.Active
+        };
+        const activeEditor = vscode.window.activeTextEditor;
+        if (activeEditor?.document.uri.path === uri.path) {
+          options.selection = activeEditor.selection;
+        }
+        await vscode.commands.executeCommand('vscode.open', uri, options);
+      } catch (error) {
+        void vscode.window.showErrorMessage(`无法打开工作副本文件：${errorMessage(error)}`);
+      }
+    });
     register('svn.diff', async (first, selected) => {
       const uri = commandUris(first, selected)[0] ?? vscode.window.activeTextEditor?.document.uri;
       if (!uri || uri.scheme !== 'file') {
@@ -661,6 +684,21 @@ function toUri(value: unknown): vscode.Uri | undefined {
     return resourceUri instanceof vscode.Uri ? resourceUri : undefined;
   }
   return undefined;
+}
+
+function toWorkingFileUri(uri: vscode.Uri): vscode.Uri | undefined {
+  if (uri.scheme === 'file') {
+    return uri;
+  }
+  if (!['svn-base', 'svn-working', 'svn-revision'].includes(uri.scheme)) {
+    return undefined;
+  }
+  const filePath = new URLSearchParams(uri.query).get('path');
+  return filePath ? vscode.Uri.file(filePath) : undefined;
+}
+
+function isSourceControlResourceState(value: unknown): boolean {
+  return value !== null && typeof value === 'object' && 'resourceUri' in value;
 }
 
 function addScope(
