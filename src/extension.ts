@@ -447,33 +447,17 @@ class RepositoryManager implements vscode.Disposable {
     try {
       const baseContent = status.item === 'added' ? '' :
         await getBaseContent(uri.fsPath);
-      const original = await vscode.workspace.openTextDocument({
-        content: baseContent,
-        language: document.languageId
-      });
       if (document.version !== documentVersion || document.isDirty) {
         void vscode.window.showWarningMessage('文件内容已变化，请重新打开快速差异后再回退。');
         return;
       }
-      const originalContent = original.getText();
-      if (originalContent.includes('\uFFFD')) {
+      if (baseContent.includes('\uFFFD')) {
         void vscode.window.showWarningMessage('SVN BASE 内容可能不是 UTF-8 编码，已取消回退以避免损坏文件。');
         return;
       }
-      if (normalizeEol(applyLineChanges(original, document, changes)) !==
-          normalizeEol(document.getText())) {
-        void vscode.window.showWarningMessage('快速差异已过期，请关闭弹窗并重新打开后再回退。');
-        return;
-      }
-      const remainingChanges = changes.filter((_, changeIndex) => changeIndex !== index);
-      const content = applyLineChanges(original, document, remainingChanges);
-      const lastLine = document.lineAt(document.lineCount - 1);
+      const changeEdit = createRevertChangeEdit(baseContent, document, changes[index]);
       const edit = new vscode.WorkspaceEdit();
-      edit.replace(
-        uri,
-        new vscode.Range(0, 0, document.lineCount - 1, lastLine.range.end.character),
-        content
-      );
+      edit.replace(uri, changeEdit.range, changeEdit.text);
       if (!await vscode.workspace.applyEdit(edit)) {
         throw new Error('VS Code 未能应用文件编辑。');
       }
@@ -617,50 +601,143 @@ function toLineChanges(value: unknown): LineChange[] | undefined {
   return changes;
 }
 
-function normalizeEol(value: string): string {
-  return value.replace(/\r\n/g, '\n');
-}
+type RevertChangeEdit = {
+  range: vscode.Range;
+  text: string;
+};
 
-function applyLineChanges(
-  original: vscode.TextDocument,
+function createRevertChangeEdit(
+  original: string,
   modified: vscode.TextDocument,
-  changes: readonly LineChange[]
-): string {
-  const result: string[] = [];
-  let currentLine = 0;
-
-  for (const change of changes) {
-    const isInsertion = change.originalEndLineNumber === 0;
-    const isDeletion = change.modifiedEndLineNumber === 0;
-    let endLine = isInsertion ?
-      change.originalStartLineNumber : change.originalStartLineNumber - 1;
-    let endCharacter = 0;
-
-    if (isDeletion && change.originalEndLineNumber === original.lineCount) {
-      endLine -= 1;
-      endCharacter = original.lineAt(endLine).range.end.character;
-    }
-    result.push(original.getText(
-      new vscode.Range(currentLine, 0, endLine, endCharacter)));
-
-    if (!isDeletion) {
-      let fromLine = change.modifiedStartLineNumber - 1;
-      let fromCharacter = 0;
-      if (isInsertion &&
-          change.originalStartLineNumber === original.lineCount) {
-        fromLine -= 1;
-        fromCharacter = modified.lineAt(fromLine).range.end.character;
-      }
-      result.push(modified.getText(new vscode.Range(
-        fromLine, fromCharacter, change.modifiedEndLineNumber, 0)));
-    }
-    currentLine = isInsertion ?
-      change.originalStartLineNumber : change.originalEndLineNumber;
+  change: LineChange
+): RevertChangeEdit {
+  const originalLines = indexTextLines(original);
+  const isInsertion = change.originalEndLineNumber === 0;
+  const isDeletion = change.modifiedEndLineNumber === 0;
+  if (isInsertion && isDeletion) {
+    throw new RangeError('差异两侧均为空。');
   }
 
-  result.push(original.getText(
-    new vscode.Range(currentLine, 0, original.lineCount, 0)));
-  return result.join('');
+  if (isInsertion) {
+    validateLineRange(
+      change.modifiedStartLineNumber,
+      change.modifiedEndLineNumber,
+      modified.lineCount
+    );
+    let start = new vscode.Position(change.modifiedStartLineNumber - 1, 0);
+    const end = documentLineRangeEnd(modified, change.modifiedEndLineNumber);
+    if (change.modifiedStartLineNumber > 1 &&
+        change.originalStartLineNumber === originalLines.starts.length &&
+        !endsWithLineBreak(original)) {
+      start = modified.lineAt(change.modifiedStartLineNumber - 2).range.end;
+    }
+    return { range: new vscode.Range(start, end), text: '' };
+  }
+
+  validateLineRange(
+    change.originalStartLineNumber,
+    change.originalEndLineNumber,
+    originalLines.starts.length
+  );
+  let text = originalLineRange(
+    original,
+    originalLines,
+    change.originalStartLineNumber,
+    change.originalEndLineNumber
+  );
+  text = convertEol(text, modified.eol);
+
+  if (isDeletion) {
+    if (change.modifiedStartLineNumber > modified.lineCount) {
+      throw new RangeError(`无效的修改后行号：${change.modifiedStartLineNumber}`);
+    }
+    const position = change.modifiedStartLineNumber < modified.lineCount
+      ? new vscode.Position(change.modifiedStartLineNumber, 0)
+      : modified.lineAt(modified.lineCount - 1).range.end;
+    if (change.modifiedStartLineNumber > 0 &&
+        change.modifiedStartLineNumber === modified.lineCount &&
+        !endsWithLineBreak(modified.getText())) {
+      text = documentEol(modified) + text;
+    }
+    return { range: new vscode.Range(position, position), text };
+  }
+
+  validateLineRange(
+    change.modifiedStartLineNumber,
+    change.modifiedEndLineNumber,
+    modified.lineCount
+  );
+  return {
+    range: new vscode.Range(
+      change.modifiedStartLineNumber - 1,
+      0,
+      documentLineRangeEnd(modified, change.modifiedEndLineNumber).line,
+      documentLineRangeEnd(modified, change.modifiedEndLineNumber).character
+    ),
+    text
+  };
+}
+
+type TextLineIndex = {
+  starts: number[];
+};
+
+function indexTextLines(content: string): TextLineIndex {
+  const starts = [0];
+  for (let index = 0; index < content.length; index += 1) {
+    const character = content.charCodeAt(index);
+    if (character !== 10 && character !== 13) {
+      continue;
+    }
+    if (character === 13 && content.charCodeAt(index + 1) === 10) {
+      index += 1;
+    }
+    starts.push(index + 1);
+  }
+  return { starts };
+}
+
+function originalLineRange(
+  content: string,
+  lines: TextLineIndex,
+  startLineNumber: number,
+  endLineNumber: number
+): string {
+  const start = lines.starts[startLineNumber - 1];
+  const end = endLineNumber < lines.starts.length
+    ? lines.starts[endLineNumber]
+    : content.length;
+  return content.slice(start, end);
+}
+
+function documentLineRangeEnd(
+  document: vscode.TextDocument,
+  endLineNumber: number
+): vscode.Position {
+  return endLineNumber < document.lineCount
+    ? new vscode.Position(endLineNumber, 0)
+    : document.lineAt(document.lineCount - 1).range.end;
+}
+
+function validateLineRange(start: number, end: number, lineCount: number): void {
+  if (start < 1 || end < start || end > lineCount) {
+    throw new RangeError(`无效的差异行范围：${start}-${end}`);
+  }
+}
+
+function convertEol(content: string, eol: vscode.EndOfLine): string {
+  return content.replace(/\r\n|\r|\n/g, documentEol(eol));
+}
+
+function documentEol(documentOrEol: vscode.TextDocument | vscode.EndOfLine): string {
+  const eol = typeof documentOrEol === 'number'
+    ? documentOrEol
+    : documentOrEol.eol;
+  return eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+}
+
+function endsWithLineBreak(content: string): boolean {
+  return /[\r\n]$/.test(content);
 }
 
 function commandUris(first: unknown, selected: unknown): vscode.Uri[] {
