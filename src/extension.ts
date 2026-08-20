@@ -160,7 +160,7 @@ class RepositoryManager implements vscode.Disposable {
         continue;
       }
       existing?.dispose();
-      this.repositories.set(key, new SvnRepository(vscode.Uri.file(discovered.root), targets));
+      this.repositories.set(key, new SvnRepository(vscode.Uri.file(discovered.root), targets, this.context.workspaceState));
     }
 
     await this.refreshAll();
@@ -249,10 +249,10 @@ class RepositoryManager implements vscode.Disposable {
       );
     });
 
-    register('svn.update', (first, selected) => this.runNative('update', commandUris(first, selected)));
-    register('svn.commit', (first, selected) => this.runNative('commit', commandUris(first, selected)));
-    register('svn.log', (first, selected) => {
-      const uri = commandUris(first, selected)[0] ?? vscode.window.activeTextEditor?.document.uri;
+    register('svn.update', (...values) => this.runNative('update', commandUris(...values)));
+    register('svn.commit', (...values) => this.runNative('commit', commandUris(...values)));
+    register('svn.log', (...values) => {
+      const uri = commandUris(...values)[0] ?? vscode.window.activeTextEditor?.document.uri;
       if (!uri || uri.scheme !== 'file') {
         void vscode.window.showWarningMessage('请选择一个本地 SVN 文件或目录查看日志。');
         return;
@@ -260,14 +260,21 @@ class RepositoryManager implements vscode.Disposable {
       this.logViewer.show(uri);
     });
     register('svn.selectionHistory', first => this.showSelectionHistory(first));
-    register('svn.revert', (first, selected) => this.confirmAndRevert(commandUris(first, selected)));
+    register('svn.revert', (...values) => this.confirmAndRevert(commandUris(...values)));
     register('svn.revertChange', (uri, changes, index) => this.revertChange(uri, changes, index));
-    register('svn.add', (first, selected) => this.runNative(
+    register('svn.add', (...values) => this.runNative(
       'add',
-      commandUris(first, selected),
+      commandUris(...values),
       status => status?.item === 'unversioned',
       '所选资源已经加入 SVN 版本管理或不在工作副本中。'
     ));
+    register('svn.moveToNewGroup', (...values) => this.moveToNewGroup(commandUris(...values)));
+    register('svn.moveToExistingGroup', (...values) => this.moveToExistingGroup(commandUris(...values)));
+    register('svn.renameGroup', group => this.renameGroup(group));
+    register('svn.deleteGroup', group => this.deleteGroup(group));
+    register('svn.commitGroup', group => this.runGroupNative('commit', group));
+    register('svn.revertGroup', group => this.revertGroup(group));
+    register('svn.createCodeReviewGroup', group => this.runGroupNative('createpatch', group));
     register('svn.commitScm', (rootArg: unknown) => {
       const rootUri = toUri(rootArg);
       if (!rootUri) {
@@ -517,6 +524,147 @@ class RepositoryManager implements vscode.Disposable {
     }
   }
 
+  private repositoryForUris(uris: readonly vscode.Uri[]): SvnRepository | undefined {
+    if (uris.length === 0) {
+      return undefined;
+    }
+    const repositories = uris.map(uri => this.repositoryForUri(uri));
+    const first = repositories[0];
+    return first && repositories.every(repository => repository === first) ? first : undefined;
+  }
+
+  private repositoryForUri(uri: vscode.Uri): SvnRepository | undefined {
+    const key = pathKey(uri.fsPath);
+    return [...this.repositories.values()]
+      .sort((left, right) => right.rootUri.fsPath.length - left.rootUri.fsPath.length)
+      .find(repository => repository.statusEntries.some(entry => pathKey(entry.path) === key));
+  }
+
+  private repositoryGroup(value: unknown):
+    { repository: SvnRepository; group: vscode.SourceControlResourceGroup } | undefined {
+    for (const repository of this.repositories.values()) {
+      const group = repository.resourceGroup(value);
+      if (group) {
+        return { repository, group };
+      }
+    }
+    return undefined;
+  }
+
+  private async moveToNewGroup(uris: vscode.Uri[]): Promise<void> {
+    const repository = this.repositoryForUris(uris);
+    if (!repository || uris.length === 0) {
+      void vscode.window.showWarningMessage('无法确定所选差异文件所属的 SVN 工作副本。');
+      return;
+    }
+    const label = await vscode.window.showInputBox({
+      title: '新建 SVN 分组',
+      prompt: '输入分组名称',
+      placeHolder: '分组名称',
+      ignoreFocusOut: true
+    });
+    if (label === undefined) {
+      return;
+    }
+    try {
+      await repository.createGroup(label, uris);
+    } catch (error) {
+      void vscode.window.showErrorMessage(errorMessage(error));
+    }
+  }
+
+  private async moveToExistingGroup(uris: vscode.Uri[]): Promise<void> {
+    const repository = this.repositoryForUris(uris);
+    if (!repository || uris.length === 0) {
+      void vscode.window.showWarningMessage('无法确定所选差异文件所属的 SVN 工作副本。');
+      return;
+    }
+    const label = await vscode.window.showQuickPick(repository.groupLabels, {
+      title: '移动到分组',
+      placeHolder: '选择目标分组',
+      ignoreFocusOut: true
+    });
+    if (!label) {
+      return;
+    }
+    const group = repository.findGroupByLabel(label);
+    if (!group) {
+      void vscode.window.showErrorMessage(`分组“${label}”已不存在。`);
+      return;
+    }
+    try {
+      await repository.moveResources(uris, group);
+    } catch (error) {
+      void vscode.window.showErrorMessage(errorMessage(error));
+    }
+  }
+
+  private async renameGroup(value: unknown): Promise<void> {
+    const resolved = this.repositoryGroup(value);
+    if (!resolved) {
+      return;
+    }
+    const current = resolved.repository.groupLabel(resolved.group);
+    const label = await vscode.window.showInputBox({
+      title: '重命名 SVN 分组',
+      prompt: '输入新的分组名称',
+      value: current,
+      valueSelection: [0, current.length],
+      ignoreFocusOut: true
+    });
+    if (label === undefined || label.trim() === current) {
+      return;
+    }
+    try {
+      await resolved.repository.renameGroup(resolved.group, label);
+    } catch (error) {
+      void vscode.window.showErrorMessage(errorMessage(error));
+    }
+  }
+
+  private async deleteGroup(value: unknown): Promise<void> {
+    const resolved = this.repositoryGroup(value);
+    if (!resolved) {
+      return;
+    }
+    const label = resolved.repository.groupLabel(resolved.group);
+    const count = resolved.group.resourceStates.length;
+    const choice = await vscode.window.showWarningMessage(
+      `是否删除分组“${label}”？组内 ${count} 个差异文件将移入默认分组。`,
+      { modal: true },
+      '删除分组'
+    );
+    if (choice !== '删除分组') {
+      return;
+    }
+    try {
+      await resolved.repository.deleteGroup(resolved.group);
+    } catch (error) {
+      void vscode.window.showErrorMessage(errorMessage(error));
+    }
+  }
+
+  private runGroupNative(command: 'commit' | 'createpatch', value: unknown): void {
+    const resolved = this.repositoryGroup(value);
+    if (!resolved) {
+      return;
+    }
+    const targets = resolved.repository.groupTargets(resolved.group);
+    if (targets.length === 0) {
+      void vscode.window.showInformationMessage(`分组“${resolved.repository.groupLabel(resolved.group)}”中没有差异文件。`);
+      return;
+    }
+    this.runNativePaths(command, targets);
+  }
+
+  private revertGroup(value: unknown): void {
+    const resolved = this.repositoryGroup(value);
+    if (!resolved) {
+      return;
+    }
+    void this.confirmAndRevert(resolved.repository.groupTargets(resolved.group).map(vscode.Uri.file));
+  }
+
   private runNative(
     command: 'update' | 'commit' | 'add',
     uris: vscode.Uri[],
@@ -541,7 +689,7 @@ class RepositoryManager implements vscode.Disposable {
   }
 
   private runNativePaths(
-    command: 'update' | 'commit' | 'add',
+    command: 'update' | 'commit' | 'add' | 'createpatch',
     targets: string[],
     extraArgs: string[] = []
   ): void {
@@ -740,15 +888,19 @@ function endsWithLineBreak(content: string): boolean {
   return /[\r\n]$/.test(content);
 }
 
-function commandUris(first: unknown, selected: unknown): vscode.Uri[] {
-  const values = [first, ...(Array.isArray(selected) ? selected : [])];
+function commandUris(...values: unknown[]): vscode.Uri[] {
   const unique = new Map<string, vscode.Uri>();
-  for (const value of values) {
+  const collect = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(collect);
+      return;
+    }
     const uri = toUri(value);
     if (uri) {
       unique.set(uri.toString(), uri);
     }
-  }
+  };
+  values.forEach(collect);
   return [...unique.values()];
 }
 

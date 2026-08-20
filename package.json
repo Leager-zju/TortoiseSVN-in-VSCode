@@ -2,7 +2,7 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "publisher": "leager",
   "license": "MIT",
   "repository": {
@@ -90,6 +90,54 @@
         "title": "刷新 SVN 状态",
         "category": "SVN",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "svn.moveToNewGroup",
+        "title": "新建分组",
+        "category": "SVN",
+        "icon": "$(add)"
+      },
+      {
+        "command": "svn.moveToExistingGroup",
+        "title": "选择已有分组…",
+        "category": "SVN",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "svn.renameGroup",
+        "title": "重命名分组",
+        "category": "SVN",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "svn.deleteGroup",
+        "title": "删除分组",
+        "category": "SVN",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "svn.commitGroup",
+        "title": "提交当前分组",
+        "category": "SVN",
+        "icon": "$(check)"
+      },
+      {
+        "command": "svn.revertGroup",
+        "title": "回退当前分组",
+        "category": "SVN",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "svn.createCodeReviewGroup",
+        "title": "创建 Code Review",
+        "category": "SVN",
+        "icon": "$(request-changes)"
+      }
+    ],
+    "submenus": [
+      {
+        "id": "svn.moveToGroup",
+        "label": "移动到分组"
       }
     ],
     "menus": {
@@ -186,6 +234,34 @@
         {
           "command": "svn.revertChange",
           "when": "false"
+        },
+        {
+          "command": "svn.moveToNewGroup",
+          "when": "false"
+        },
+        {
+          "command": "svn.moveToExistingGroup",
+          "when": "false"
+        },
+        {
+          "command": "svn.renameGroup",
+          "when": "false"
+        },
+        {
+          "command": "svn.deleteGroup",
+          "when": "false"
+        },
+        {
+          "command": "svn.commitGroup",
+          "when": "false"
+        },
+        {
+          "command": "svn.revertGroup",
+          "when": "false"
+        },
+        {
+          "command": "svn.createCodeReviewGroup",
+          "when": "false"
         }
       ],
       "scm/resourceState/context": [
@@ -205,6 +281,11 @@
           "group": "inline@3"
         },
         {
+          "submenu": "svn.moveToGroup",
+          "when": "scmProvider == svn && scmResourceState == svn.changed",
+          "group": "navigation@1"
+        },
+        {
           "command": "svn.commit",
           "when": "scmProvider == svn && isWindows",
           "group": "navigation@2"
@@ -213,6 +294,45 @@
           "command": "svn.log",
           "when": "scmProvider == svn",
           "group": "navigation@3"
+        }
+      ],
+      "svn.moveToGroup": [
+        {
+          "command": "svn.moveToNewGroup",
+          "when": "scmProvider == svn",
+          "group": "1_create@1"
+        },
+        {
+          "command": "svn.moveToExistingGroup",
+          "when": "scmProvider == svn",
+          "group": "2_groups@1"
+        }
+      ],
+      "scm/resourceGroup/context": [
+        {
+          "command": "svn.commitGroup",
+          "when": "scmProvider == svn && isWindows",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "svn.revertGroup",
+          "when": "scmProvider == svn && isWindows",
+          "group": "1_actions@2"
+        },
+        {
+          "command": "svn.createCodeReviewGroup",
+          "when": "scmProvider == svn && isWindows",
+          "group": "1_actions@3"
+        },
+        {
+          "command": "svn.renameGroup",
+          "when": "scmProvider == svn && scmResourceGroup =~ /^custom-/",
+          "group": "2_manage@1"
+        },
+        {
+          "command": "svn.deleteGroup",
+          "when": "scmProvider == svn && scmResourceGroup =~ /^custom-/",
+          "group": "2_manage@2"
         }
       ]
     },
