@@ -274,7 +274,7 @@ class RepositoryManager implements vscode.Disposable {
     register('svn.deleteGroup', group => this.deleteGroup(group));
     register('svn.commitGroup', group => this.runGroupNative('commit', group));
     register('svn.revertGroup', group => this.revertGroup(group));
-    register('svn.createCodeReviewGroup', group => this.runGroupNative('createpatch', group));
+    register('svn.createCodeReviewGroup', group => this.runGroupNative('gfcreatecr', group));
     register('svn.commitScm', (rootArg: unknown) => {
       const rootUri = toUri(rootArg);
       if (!rootUri) {
@@ -644,7 +644,7 @@ class RepositoryManager implements vscode.Disposable {
     }
   }
 
-  private runGroupNative(command: 'commit' | 'createpatch', value: unknown): void {
+  private runGroupNative(command: 'commit' | 'gfcreatecr', value: unknown): void {
     const resolved = this.repositoryGroup(value);
     if (!resolved) {
       return;
@@ -689,7 +689,7 @@ class RepositoryManager implements vscode.Disposable {
   }
 
   private runNativePaths(
-    command: 'update' | 'commit' | 'add' | 'createpatch',
+    command: 'update' | 'commit' | 'add' | 'gfcreatecr',
     targets: string[],
     extraArgs: string[] = []
   ): void {

@@ -325,7 +325,7 @@ export async function revertSvnTargets(targets: string[]): Promise<void> {
 }
 
 export function launchTortoise(
-  command: 'update'|'commit'|'add'|'createpatch', targets: string[],
+  command: 'update'|'commit'|'add'|'gfcreatecr', targets: string[],
     extraArgs: string[] = []): ChildProcess {
   if (process.platform !== 'win32') {
     throw new Error('TortoiseSVN 原生窗口仅支持 Windows。');
