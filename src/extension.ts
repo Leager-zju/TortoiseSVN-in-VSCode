@@ -21,6 +21,7 @@ class SvnDocumentProvider implements vscode.TextDocumentContentProvider {
     const parameters = new URLSearchParams(uri.query);
     const filePath = parameters.get('path');
     if (!filePath) {
+      
       return '';
     }
 
@@ -240,7 +241,9 @@ class RepositoryManager implements vscode.Disposable {
         return;
       }
       const base = createVirtualDocumentUri('svn-base', uri);
-      const working = createVirtualDocumentUri('svn-working', uri);
+      const working = status.item === 'deleted' || status.item === 'missing'
+        ? createVirtualDocumentUri('svn-working', uri)
+        : uri;
       await vscode.commands.executeCommand(
         'vscode.diff',
         base,

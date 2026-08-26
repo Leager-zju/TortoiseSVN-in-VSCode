@@ -227,7 +227,7 @@
       "scm/change/title": [
         {
           "command": "svn.revertChange",
-          "when": "originalResource =~ /^svn-base\\:/"
+          "when": "originalResourceScheme == svn-base"
         }
       ],
       "commandPalette": [
