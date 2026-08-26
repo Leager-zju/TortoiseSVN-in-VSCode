@@ -2,7 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { SvnLogViewer } from './logView';
-import { createVirtualDocumentUri, isVersionedChange, SvnRepository } from './scm';
+import { createVirtualDocumentUri, isVersionedChange, SvnRepository, SvnSourceControl } from './scm';
 import { SelectionHistoryLine, SvnSelectionHistoryViewer } from './selectionHistoryView';
 import {
   findWorkingCopyRoot,
@@ -60,12 +60,16 @@ class RepositoryManager implements vscode.Disposable {
   private readonly output = vscode.window.createOutputChannel('SVN');
   private readonly logViewer = new SvnLogViewer();
   private readonly selectionHistoryViewer = new SvnSelectionHistoryViewer();
+  private readonly sourceControl: SvnSourceControl;
   private refreshTimer: NodeJS.Timeout | undefined;
   private refreshDebounce: NodeJS.Timeout | undefined;
+  private discoveryDebounce: NodeJS.Timeout | undefined;
   private discovering: Promise<void> | undefined;
+  private rediscoveryRequested = false;
   private readonly selectionHistoryRequests = new Map<string, number>();
 
   constructor(private readonly context: vscode.ExtensionContext) {
+    this.sourceControl = new SvnSourceControl(context.workspaceState);
     context.subscriptions.push(this.output);
   }
 
@@ -78,27 +82,35 @@ class RepositoryManager implements vscode.Disposable {
 
   async discoverRepositories(): Promise<void> {
     if (this.discovering) {
+      this.rediscoveryRequested = true;
       return this.discovering;
     }
-    this.discovering = this.doDiscoverRepositories();
-    try {
-      await this.discovering;
-    } finally {
-      this.discovering = undefined;
-    }
+
+    do {
+      this.rediscoveryRequested = false;
+      this.discovering = this.doDiscoverRepositories();
+      try {
+        await this.discovering;
+      } finally {
+        this.discovering = undefined;
+      }
+    } while (this.rediscoveryRequested);
   }
 
   async refreshAll(showErrors = false): Promise<void> {
-    const results = await Promise.allSettled([...this.repositories.values()].map(repository => repository.refresh()));
-    for (const result of results) {
+    const repositories = [...this.repositories.values()];
+    const results = await Promise.allSettled(repositories.map(repository => repository.refresh()));
+    this.sourceControl.update();
+    results.forEach((result, index) => {
       if (result.status === 'rejected') {
+        const repository = repositories[index];
         const message = errorMessage(result.reason);
-        this.output.appendLine(`[${new Date().toLocaleTimeString()}] ${message}`);
+        this.log(`状态查询失败：root=${repository.rootUri.fsPath} targets=${formatPaths(repository.targets)} error=${message}`);
         if (showErrors) {
           void vscode.window.showErrorMessage(`SVN 状态刷新失败：${message}`);
         }
       }
-    }
+    });
     await this.updateResourceContexts();
   }
 
@@ -106,7 +118,22 @@ class RepositoryManager implements vscode.Disposable {
     if (this.refreshDebounce) {
       clearTimeout(this.refreshDebounce);
     }
-    this.refreshDebounce = setTimeout(() => void this.refreshAll(), 500);
+    this.refreshDebounce = setTimeout(() => {
+      void this.refreshAll().catch(error => this.log(`延迟刷新失败：${errorMessage(error)}`));
+    }, 500);
+  }
+
+  scheduleDiscovery(): void {
+    if (this.discoveryDebounce) {
+      clearTimeout(this.discoveryDebounce);
+    }
+    this.discoveryDebounce = setTimeout(() => {
+      void this.discoverRepositories().catch(error => this.log(`延迟发现失败：${errorMessage(error)}`));
+    }, 500);
+  }
+
+  private log(message: string): void {
+    this.output.appendLine(`[${new Date().toISOString()}] ${message}`);
   }
 
   dispose(): void {
@@ -116,10 +143,11 @@ class RepositoryManager implements vscode.Disposable {
     if (this.refreshDebounce) {
       clearTimeout(this.refreshDebounce);
     }
-    for (const repository of this.repositories.values()) {
-      repository.dispose();
+    if (this.discoveryDebounce) {
+      clearTimeout(this.discoveryDebounce);
     }
     this.repositories.clear();
+    this.sourceControl.dispose();
     this.logViewer.dispose();
     this.selectionHistoryViewer.dispose();
     void vscode.commands.executeCommand('setContext', 'svn.changedResourcePaths', []);
@@ -129,58 +157,83 @@ class RepositoryManager implements vscode.Disposable {
   private async doDiscoverRepositories(): Promise<void> {
     const folders = vscode.workspace.workspaceFolders ?? [];
     const scopesByRoot = new Map<string, { root: string; scopes: Set<string> }>();
+    let discoveryComplete = true;
 
-    await Promise.all(
-      folders.map(async folder => {
-        const [containingRoot, adminFiles] = await Promise.all([
-          findWorkingCopyRoot(folder.uri.fsPath),
-          vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/.svn/wc.db'), null, 200)
-        ]);
+    await Promise.all(folders.map(async folder => {
+      const folderPath = folder.uri.fsPath;
+      const [rootResult, vscodeSearchResult, nativeSearchResult] = await Promise.allSettled([
+        findWorkingCopyRoot(folderPath),
+        vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/.svn/wc.db'), null),
+        findWorkingCopyAdminFiles(folderPath, message => this.log(message))
+      ]);
 
-        if (containingRoot) {
-          addScope(scopesByRoot, containingRoot, folder.uri.fsPath);
+      if (rootResult.status === 'fulfilled') {
+        if (rootResult.value) {
+          addScope(scopesByRoot, rootResult.value, folderPath);
         }
-        for (const adminFile of adminFiles) {
-          const nestedRoot = path.dirname(path.dirname(adminFile.fsPath));
-          addScope(scopesByRoot, nestedRoot, nestedRoot);
-        }
-      })
-    );
+      } else {
+        discoveryComplete = false;
+        this.log(`ERROR 查询工作区所属工作副本失败：folder=${folderPath} error=${errorMessage(rootResult.reason)}`);
+      }
 
-    for (const [key, repository] of this.repositories) {
-      if (!scopesByRoot.has(key)) {
-        repository.dispose();
-        this.repositories.delete(key);
+      const adminFiles = new Map<string, string>();
+      if (vscodeSearchResult.status === 'fulfilled') {
+        for (const uri of vscodeSearchResult.value) {
+          adminFiles.set(pathKey(uri.fsPath), uri.fsPath);
+        }
+      } else {
+        discoveryComplete = false;
+        this.log(`ERROR VS Code 搜索 SVN 管理文件失败：folder=${folderPath} error=${errorMessage(vscodeSearchResult.reason)}`);
+      }
+
+      if (nativeSearchResult.status === 'fulfilled') {
+        const scan = nativeSearchResult.value;
+        discoveryComplete = discoveryComplete && scan.errors === 0;
+        for (const adminFile of scan.adminFiles) {
+          adminFiles.set(pathKey(adminFile), adminFile);
+        }
+      } else {
+        discoveryComplete = false;
+        this.log(`ERROR 原生扫描 SVN 管理文件失败：folder=${folderPath} error=${errorMessage(nativeSearchResult.reason)}`);
+      }
+
+      for (const adminFile of adminFiles.values()) {
+        addScope(scopesByRoot, path.dirname(path.dirname(adminFile)), path.dirname(path.dirname(adminFile)));
+      }
+    }));
+
+    if (discoveryComplete) {
+      for (const [key, repository] of this.repositories) {
+        if (!scopesByRoot.has(key)) {
+          this.repositories.delete(key);
+        }
       }
     }
 
     for (const [key, discovered] of scopesByRoot) {
       const targets = compactScopes(discovered.root, [...discovered.scopes]);
       const existing = this.repositories.get(key);
-      if (existing && samePaths(existing.targets, targets)) {
-        continue;
+      if (!existing || !samePaths(existing.targets, targets)) {
+        this.repositories.set(key, new SvnRepository(vscode.Uri.file(discovered.root), targets));
       }
-      existing?.dispose();
-      this.repositories.set(key, new SvnRepository(vscode.Uri.file(discovered.root), targets, this.context.workspaceState));
     }
 
+    await this.sourceControl.setRepositories([...this.repositories.values()]);
     await this.refreshAll();
   }
 
   private async updateResourceContexts(): Promise<void> {
     const changedPaths = new Set<string>();
     const unversionedPaths = new Set<string>();
-    for (const repository of this.repositories.values()) {
-      for (const entry of repository.statusEntries) {
-        const values = [vscode.Uri.file(entry.path).path, vscode.Uri.file(entry.path).fsPath];
-        const target = entry.item === 'unversioned'
-          ? unversionedPaths
-          : isVersionedChange(entry)
-            ? changedPaths
-            : undefined;
-        if (target) {
-          values.forEach(value => target.add(value));
-        }
+    for (const entry of this.sourceControl.statusEntries) {
+      const values = [vscode.Uri.file(entry.path).path, vscode.Uri.file(entry.path).fsPath];
+      const target = entry.item === 'unversioned'
+        ? unversionedPaths
+        : isVersionedChange(entry)
+          ? changedPaths
+          : undefined;
+      if (target) {
+        values.forEach(value => target.add(value));
       }
     }
     await Promise.all([
@@ -190,14 +243,7 @@ class RepositoryManager implements vscode.Disposable {
   }
 
   private statusFor(uri: vscode.Uri): SvnStatusEntry | undefined {
-    const key = pathKey(uri.fsPath);
-    for (const repository of this.repositories.values()) {
-      const status = repository.statusEntries.find(entry => pathKey(entry.path) === key);
-      if (status) {
-        return status;
-      }
-    }
-    return undefined;
+    return this.sourceControl.statusFor(uri);
   }
 
   private registerCommands(): void {
@@ -205,7 +251,10 @@ class RepositoryManager implements vscode.Disposable {
       this.context.subscriptions.push(vscode.commands.registerCommand(command, callback));
     };
 
-    register('svn.refresh', () => this.refreshAll(true));
+    register('svn.refresh', () => {
+      this.output.show(true);
+      return this.discoverRepositories();
+    });
     register('svn.openFile', async first => {
       const source = toUri(first) ?? vscode.window.activeTextEditor?.document.uri;
       const uri = source ? toWorkingFileUri(source) : undefined;
@@ -271,6 +320,12 @@ class RepositoryManager implements vscode.Disposable {
       status => status?.item === 'unversioned',
       '所选资源已经加入 SVN 版本管理或不在工作副本中。'
     ));
+    register('svn.createCodeReview', (...values) => this.runNative(
+      'gfcreatecr',
+      commandUris(...values),
+      status => status !== undefined && isVersionedChange(status),
+      '所选资源没有可创建 Code Review 的 SVN 改动。'
+    ));
     register('svn.moveToNewGroup', (...values) => this.moveToNewGroup(commandUris(...values)));
     register('svn.moveToExistingGroup', (...values) => this.moveToExistingGroup(commandUris(...values)));
     register('svn.renameGroup', group => this.renameGroup(group));
@@ -278,20 +333,6 @@ class RepositoryManager implements vscode.Disposable {
     register('svn.commitGroup', group => this.runGroupNative('commit', group));
     register('svn.revertGroup', group => this.revertGroup(group));
     register('svn.createCodeReviewGroup', group => this.runGroupNative('gfcreatecr', group));
-    register('svn.commitScm', (rootArg: unknown) => {
-      const rootUri = toUri(rootArg);
-      if (!rootUri) {
-        return;
-      }
-      const repository = this.repositories.get(pathKey(rootUri.fsPath));
-      if (!repository) {
-        return;
-      }
-      const message = repository.sourceControl.inputBox.value.trim();
-      const extraArgs = message ? [`/logmsg:${message}`] : [];
-      this.runNativePaths('commit', repository.targets, extraArgs);
-      repository.sourceControl.inputBox.value = '';
-    });
   }
 
   private async showSelectionHistory(contextValue: unknown): Promise<void> {
@@ -380,7 +421,11 @@ class RepositoryManager implements vscode.Disposable {
   }
 
   private registerEvents(): void {
+    const workingCopyWatcher = vscode.workspace.createFileSystemWatcher('**/.svn/wc.db');
     this.context.subscriptions.push(
+      workingCopyWatcher,
+      workingCopyWatcher.onDidCreate(() => this.scheduleDiscovery()),
+      workingCopyWatcher.onDidDelete(() => this.scheduleDiscovery()),
       vscode.workspace.onDidSaveTextDocument(() => this.scheduleRefresh()),
       vscode.workspace.onDidCreateFiles(() => this.scheduleRefresh()),
       vscode.workspace.onDidDeleteFiles(() => this.scheduleRefresh()),
@@ -519,7 +564,7 @@ class RepositoryManager implements vscode.Disposable {
           location: vscode.ProgressLocation.Notification,
           title: singleFile ? `正在回退 ${path.basename(targets[0])}…` : `正在回退 ${targets.length} 个文件…`
         },
-        () => revertSvnTargets(targets)
+        () => Promise.all(this.partitionTargets(targets).map(partition => revertSvnTargets(partition))).then(() => undefined)
       );
       await this.refreshAll(true);
     } catch (error) {
@@ -527,37 +572,9 @@ class RepositoryManager implements vscode.Disposable {
     }
   }
 
-  private repositoryForUris(uris: readonly vscode.Uri[]): SvnRepository | undefined {
-    if (uris.length === 0) {
-      return undefined;
-    }
-    const repositories = uris.map(uri => this.repositoryForUri(uri));
-    const first = repositories[0];
-    return first && repositories.every(repository => repository === first) ? first : undefined;
-  }
-
-  private repositoryForUri(uri: vscode.Uri): SvnRepository | undefined {
-    const key = pathKey(uri.fsPath);
-    return [...this.repositories.values()]
-      .sort((left, right) => right.rootUri.fsPath.length - left.rootUri.fsPath.length)
-      .find(repository => repository.statusEntries.some(entry => pathKey(entry.path) === key));
-  }
-
-  private repositoryGroup(value: unknown):
-    { repository: SvnRepository; group: vscode.SourceControlResourceGroup } | undefined {
-    for (const repository of this.repositories.values()) {
-      const group = repository.resourceGroup(value);
-      if (group) {
-        return { repository, group };
-      }
-    }
-    return undefined;
-  }
-
   private async moveToNewGroup(uris: vscode.Uri[]): Promise<void> {
-    const repository = this.repositoryForUris(uris);
-    if (!repository || uris.length === 0) {
-      void vscode.window.showWarningMessage('无法确定所选差异文件所属的 SVN 工作副本。');
+    if (uris.length === 0) {
+      void vscode.window.showWarningMessage('请选择要分组的 SVN 差异文件。');
       return;
     }
     const label = await vscode.window.showInputBox({
@@ -570,19 +587,18 @@ class RepositoryManager implements vscode.Disposable {
       return;
     }
     try {
-      await repository.createGroup(label, uris);
+      await this.sourceControl.createGroup(label, uris);
     } catch (error) {
       void vscode.window.showErrorMessage(errorMessage(error));
     }
   }
 
   private async moveToExistingGroup(uris: vscode.Uri[]): Promise<void> {
-    const repository = this.repositoryForUris(uris);
-    if (!repository || uris.length === 0) {
-      void vscode.window.showWarningMessage('无法确定所选差异文件所属的 SVN 工作副本。');
+    if (uris.length === 0) {
+      void vscode.window.showWarningMessage('请选择要分组的 SVN 差异文件。');
       return;
     }
-    const label = await vscode.window.showQuickPick(repository.groupLabels, {
+    const label = await vscode.window.showQuickPick(this.sourceControl.groupLabels, {
       title: '移动到分组',
       placeHolder: '选择目标分组',
       ignoreFocusOut: true
@@ -590,24 +606,24 @@ class RepositoryManager implements vscode.Disposable {
     if (!label) {
       return;
     }
-    const group = repository.findGroupByLabel(label);
+    const group = this.sourceControl.findGroupByLabel(label);
     if (!group) {
       void vscode.window.showErrorMessage(`分组“${label}”已不存在。`);
       return;
     }
     try {
-      await repository.moveResources(uris, group);
+      await this.sourceControl.moveResources(uris, group);
     } catch (error) {
       void vscode.window.showErrorMessage(errorMessage(error));
     }
   }
 
   private async renameGroup(value: unknown): Promise<void> {
-    const resolved = this.repositoryGroup(value);
-    if (!resolved) {
+    const group = this.sourceControl.resourceGroup(value);
+    if (!group) {
       return;
     }
-    const current = resolved.repository.groupLabel(resolved.group);
+    const current = this.sourceControl.groupLabel(group);
     const label = await vscode.window.showInputBox({
       title: '重命名 SVN 分组',
       prompt: '输入新的分组名称',
@@ -619,19 +635,19 @@ class RepositoryManager implements vscode.Disposable {
       return;
     }
     try {
-      await resolved.repository.renameGroup(resolved.group, label);
+      await this.sourceControl.renameGroup(group, label);
     } catch (error) {
       void vscode.window.showErrorMessage(errorMessage(error));
     }
   }
 
   private async deleteGroup(value: unknown): Promise<void> {
-    const resolved = this.repositoryGroup(value);
-    if (!resolved) {
+    const group = this.sourceControl.resourceGroup(value);
+    if (!group) {
       return;
     }
-    const label = resolved.repository.groupLabel(resolved.group);
-    const count = resolved.group.resourceStates.length;
+    const label = this.sourceControl.groupLabel(group);
+    const count = group.resourceStates.length;
     const choice = await vscode.window.showWarningMessage(
       `是否删除分组“${label}”？组内 ${count} 个差异文件将移入默认分组。`,
       { modal: true },
@@ -641,35 +657,35 @@ class RepositoryManager implements vscode.Disposable {
       return;
     }
     try {
-      await resolved.repository.deleteGroup(resolved.group);
+      await this.sourceControl.deleteGroup(group);
     } catch (error) {
       void vscode.window.showErrorMessage(errorMessage(error));
     }
   }
 
   private runGroupNative(command: 'commit' | 'gfcreatecr', value: unknown): void {
-    const resolved = this.repositoryGroup(value);
-    if (!resolved) {
+    const group = this.sourceControl.resourceGroup(value);
+    if (!group) {
       return;
     }
-    const targets = resolved.repository.groupTargets(resolved.group);
+    const targets = this.sourceControl.groupTargets(group);
     if (targets.length === 0) {
-      void vscode.window.showInformationMessage(`分组“${resolved.repository.groupLabel(resolved.group)}”中没有差异文件。`);
+      void vscode.window.showInformationMessage(`分组“${this.sourceControl.groupLabel(group)}”中没有差异文件。`);
       return;
     }
     this.runNativePaths(command, targets);
   }
 
   private revertGroup(value: unknown): void {
-    const resolved = this.repositoryGroup(value);
-    if (!resolved) {
+    const group = this.sourceControl.resourceGroup(value);
+    if (!group) {
       return;
     }
-    void this.confirmAndRevert(resolved.repository.groupTargets(resolved.group).map(vscode.Uri.file));
+    void this.confirmAndRevert(this.sourceControl.groupTargets(group).map(vscode.Uri.file));
   }
 
   private runNative(
-    command: 'update' | 'commit' | 'add',
+    command: 'update' | 'commit' | 'add' | 'gfcreatecr',
     uris: vscode.Uri[],
     accepts?: (status: SvnStatusEntry | undefined) => boolean,
     emptyMessage = '没有可操作的文件或目录。'
@@ -684,6 +700,9 @@ class RepositoryManager implements vscode.Disposable {
     const targets = resources
       .filter(uri => accepts?.(this.statusFor(uri)) ?? true)
       .map(uri => uri.fsPath);
+    if (command === 'update' && targets.length === 0) {
+      targets.push(...[...this.repositories.values()].flatMap(repository => repository.targets));
+    }
     if (targets.length === 0) {
       void vscode.window.showInformationMessage(emptyMessage);
       return;
@@ -693,16 +712,29 @@ class RepositoryManager implements vscode.Disposable {
 
   private runNativePaths(
     command: 'update' | 'commit' | 'add' | 'gfcreatecr',
-    targets: string[],
-    extraArgs: string[] = []
+    targets: string[]
   ): void {
-    try {
-      const child = launchTortoise(command, targets, extraArgs);
-      child.once('error', error => void vscode.window.showErrorMessage(`无法启动 TortoiseSVN：${error.message}`));
-      child.once('close', () => this.scheduleRefresh());
-    } catch (error) {
-      void vscode.window.showErrorMessage(errorMessage(error));
+    for (const partition of this.partitionTargets(targets)) {
+      try {
+        const child = launchTortoise(command, partition);
+        child.once('error', error => void vscode.window.showErrorMessage(`无法启动 TortoiseSVN：${error.message}`));
+        child.once('close', () => this.scheduleRefresh());
+      } catch (error) {
+        void vscode.window.showErrorMessage(errorMessage(error));
+      }
     }
+  }
+
+  private partitionTargets(targets: readonly string[]): string[][] {
+    const partitions = new Map<string, string[]>();
+    for (const target of targets) {
+      const repository = this.sourceControl.repositoryForUri(vscode.Uri.file(target));
+      const key = repository ? pathKey(repository.rootUri.fsPath) : '';
+      const partition = partitions.get(key) ?? [];
+      partition.push(target);
+      partitions.set(key, partition);
+    }
+    return [...partitions.values()];
   }
 }
 
@@ -931,6 +963,67 @@ function toWorkingFileUri(uri: vscode.Uri): vscode.Uri | undefined {
 
 function isSourceControlResourceState(value: unknown): boolean {
   return value !== null && typeof value === 'object' && 'resourceUri' in value;
+}
+
+type WorkingCopyScanResult = {
+  adminFiles: string[];
+  scannedDirectories: number;
+  errors: number;
+  elapsedMs: number;
+};
+
+async function findWorkingCopyAdminFiles(
+  rootPath: string,
+  log: (message: string) => void
+): Promise<WorkingCopyScanResult> {
+  const startedAt = Date.now();
+  const adminFiles: string[] = [];
+  const pending = [path.normalize(rootPath)];
+  let scannedDirectories = 0;
+  let errors = 0;
+  while (pending.length > 0) {
+    const batch = pending.splice(0, 32);
+    const discoveredChildren = await Promise.all(batch.map(async directory => {
+      try {
+        const entries = await fs.readdir(directory, { withFileTypes: true });
+        scannedDirectories += 1;
+        const svnDirectory = entries.find(entry =>
+          entry.isDirectory() && entry.name.toLocaleLowerCase() === '.svn');
+        if (svnDirectory) {
+          const wcDatabase = path.join(directory, svnDirectory.name, 'wc.db');
+          try {
+            const stat = await fs.stat(wcDatabase);
+            if (stat.isFile()) {
+              adminFiles.push(path.normalize(wcDatabase));
+            }
+          } catch (error) {
+            log(`ERROR 原生扫描发现 .svn 但无法读取 wc.db：path=${wcDatabase} error=${errorMessage(error)}`);
+          }
+        }
+
+        return entries
+          .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() &&
+            entry.name.toLocaleLowerCase() !== '.svn')
+          .map(entry => path.join(directory, entry.name));
+      } catch (error) {
+        errors += 1;
+        log(`ERROR 原生扫描目录失败：path=${directory} error=${errorMessage(error)}`);
+        return [];
+      }
+    }));
+    pending.push(...discoveredChildren.flat());
+  }
+
+  return {
+    adminFiles,
+    scannedDirectories,
+    errors,
+    elapsedMs: Date.now() - startedAt
+  };
+}
+
+function formatPaths(paths: readonly string[]): string {
+  return paths.length === 0 ? '[]' : `[${paths.join(' | ')}]`;
 }
 
 function addScope(

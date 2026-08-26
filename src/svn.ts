@@ -86,15 +86,11 @@ export function runSvn(args: string[], cwd?: string, maxBuffer = 20 * 1024 * 102
 
 export async function findWorkingCopyRoot(targetPath: string):
     Promise<string|undefined> {
-  try {
-    const output = await runSvn(
-        ['info', '--show-item', 'wc-root', '--', withPegEscape(targetPath)],
-        path.dirname(targetPath));
-    const root = output.trim();
-    return root || undefined;
-  } catch {
-    return undefined;
-  }
+  const output = await runSvn(
+      ['info', '--show-item', 'wc-root', '--', withPegEscape(targetPath)],
+      path.dirname(targetPath));
+  const root = output.trim();
+  return root || undefined;
 }
 
 export async function getSvnStatus(
@@ -127,12 +123,13 @@ export async function getSvnStatus(
       }
       const item = status.item ?? 'none';
       const props = status.props ?? 'none';
-      if (!shouldExposeStatus(item, props)) {
+      const filePath = path.isAbsolute(entry.path) ? path.normalize(entry.path) :
+                                                     path.resolve(rootPath, entry.path);
+      if (isSvnAdminPath(filePath) || !shouldExposeStatus(item, props)) {
         continue;
       }
       entries.push({
-        path: path.isAbsolute(entry.path) ? path.normalize(entry.path) :
-                                            path.resolve(rootPath, entry.path),
+        path: filePath,
         item,
         props,
         revision: status.revision
@@ -140,6 +137,10 @@ export async function getSvnStatus(
     }
   }
   return entries;
+}
+
+function isSvnAdminPath(filePath: string): boolean {
+  return filePath.split(/[\\/]+/).some(segment => segment.toLocaleLowerCase() === '.svn');
 }
 
 function shouldExposeStatus(item: string, props: string): boolean {
@@ -325,8 +326,7 @@ export async function revertSvnTargets(targets: string[]): Promise<void> {
 }
 
 export function launchTortoise(
-  command: 'update'|'commit'|'add'|'gfcreatecr', targets: string[],
-    extraArgs: string[] = []): ChildProcess {
+  command: 'update'|'commit'|'add'|'gfcreatecr', targets: string[]): ChildProcess {
   if (process.platform !== 'win32') {
     throw new Error('TortoiseSVN 原生窗口仅支持 Windows。');
   }
@@ -334,8 +334,7 @@ export function launchTortoise(
     throw new Error('没有可操作的文件或目录。');
   }
 
-  const args =
-      [`/command:${command}`, `/path:${targets.join('*')}`, ...extraArgs];
+  const args = [`/command:${command}`, `/path:${targets.join('*')}`];
   return spawn(
       tortoiseExecutable(), args,
       {cwd: path.dirname(targets[0]), stdio: 'ignore', windowsHide: false});

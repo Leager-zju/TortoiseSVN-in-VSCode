@@ -12,45 +12,70 @@ type StoredGroupState = {
   groups: StoredGroup[];
   assignments: Record<string, string>;
 };
+type GlobalStoredGroupState = StoredGroupState & {
+  version: 2;
+  migratedRepositories: string[];
+};
+type IndexedStatus = {
+  entry: SvnStatusEntry;
+  repository: SvnRepository;
+};
 
 const DEFAULT_GROUP_ID = 'changes';
 const DEFAULT_GROUP_LABEL = '默认分组';
 const GROUP_STORAGE_PREFIX = 'svn.resourceGroups.';
+const GLOBAL_GROUP_STORAGE_KEY = 'svn.resourceGroups.global.v2';
 
-export class SvnRepository implements vscode.Disposable, vscode.FileDecorationProvider {
-  readonly sourceControl: vscode.SourceControl;
-  readonly changes: vscode.SourceControlResourceGroup;
-  private readonly decorationEmitter = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
-  readonly onDidChangeFileDecorations = this.decorationEmitter.event;
-  private readonly decorationRegistration: vscode.Disposable;
-  private readonly storageKey: string;
-  private readonly resourceGroups = new Map<string, vscode.SourceControlResourceGroup>();
-  private storedGroups: StoredGroup[];
-  private assignments: Record<string, string>;
+export class SvnRepository {
   private statuses = new Map<string, SvnStatusEntry>();
   private refreshing = false;
 
   constructor(
     readonly rootUri: vscode.Uri,
-    readonly targets: string[],
-    private readonly workspaceState: vscode.Memento
-  ) {
-    this.sourceControl = vscode.scm.createSourceControl('svn', `SVN: ${path.basename(rootUri.fsPath)}`, rootUri);
+    readonly targets: string[]
+  ) {}
+
+  get statusEntries(): readonly SvnStatusEntry[] {
+    return [...this.statuses.values()];
+  }
+
+  async refresh(): Promise<void> {
+    if (this.refreshing) {
+      return;
+    }
+    this.refreshing = true;
+    try {
+      const entries = await getSvnStatus(this.rootUri.fsPath, this.targets);
+      this.statuses = new Map(entries.map(entry => [pathKey(entry.path), entry]));
+    } finally {
+      this.refreshing = false;
+    }
+  }
+}
+
+export class SvnSourceControl implements vscode.Disposable, vscode.FileDecorationProvider {
+  readonly sourceControl: vscode.SourceControl;
+  readonly changes: vscode.SourceControlResourceGroup;
+  private readonly decorationEmitter = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
+  readonly onDidChangeFileDecorations = this.decorationEmitter.event;
+  private readonly decorationRegistration: vscode.Disposable;
+  private readonly resourceGroups = new Map<string, vscode.SourceControlResourceGroup>();
+  private readonly migratedRepositories: Set<string>;
+  private storedGroups: StoredGroup[];
+  private assignments: Record<string, string>;
+  private repositories: SvnRepository[] = [];
+  private statuses = new Map<string, IndexedStatus>();
+
+  constructor(private readonly workspaceState: vscode.Memento) {
+    this.sourceControl = vscode.scm.createSourceControl('svn', 'SVN Compass');
     this.changes = this.sourceControl.createResourceGroup(DEFAULT_GROUP_ID, DEFAULT_GROUP_LABEL);
     this.resourceGroups.set(DEFAULT_GROUP_ID, this.changes);
-    this.storageKey = `${GROUP_STORAGE_PREFIX}${rootUri.toString()}`;
-    const stored = workspaceState.get<StoredGroupState>(this.storageKey);
+    const stored = workspaceState.get<GlobalStoredGroupState>(GLOBAL_GROUP_STORAGE_KEY);
     this.storedGroups = sanitizeStoredGroups(stored?.groups);
-    this.assignments = stored?.assignments && typeof stored.assignments === 'object'
-      ? { ...stored.assignments }
-      : {};
+    this.assignments = sanitizeAssignments(stored?.assignments);
+    this.migratedRepositories = new Set(stored?.version === 2 ? stored.migratedRepositories : []);
     this.createStoredResourceGroups();
-    this.sourceControl.inputBox.placeholder = '提交消息（可选，将预填到 TortoiseSVN）';
-    this.sourceControl.acceptInputCommand = {
-      command: 'svn.commitScm',
-      title: 'SVN 提交',
-      arguments: [rootUri]
-    };
+    this.sourceControl.inputBox.visible = false;
     this.sourceControl.quickDiffProvider = {
       provideOriginalResource: uri => createVirtualDocumentUri('svn-base', uri)
     };
@@ -58,11 +83,51 @@ export class SvnRepository implements vscode.Disposable, vscode.FileDecorationPr
   }
 
   get statusEntries(): readonly SvnStatusEntry[] {
-    return [...this.statuses.values()];
+    return [...this.statuses.values()].map(value => value.entry);
   }
 
   get groupLabels(): readonly string[] {
     return [DEFAULT_GROUP_LABEL, ...this.storedGroups.map(group => group.label)];
+  }
+
+  async setRepositories(repositories: readonly SvnRepository[]): Promise<void> {
+    this.repositories = [...repositories]
+      .sort((left, right) => right.rootUri.fsPath.length - left.rootUri.fsPath.length);
+    if (this.migrateRepositoryGroups()) {
+      await this.persistGroups();
+    }
+    this.update();
+  }
+
+  update(): void {
+    const nextStatuses = new Map<string, IndexedStatus>();
+    const repositories = [...this.repositories]
+      .sort((left, right) => left.rootUri.fsPath.length - right.rootUri.fsPath.length);
+    for (const repository of repositories) {
+      for (const entry of repository.statusEntries) {
+        nextStatuses.set(pathKey(entry.path), { entry, repository });
+      }
+    }
+
+    const changedDecorations = changedStatusUris(this.statuses, nextStatuses);
+    this.statuses = nextStatuses;
+    this.updateResourceGroups();
+    if (changedDecorations.length > 0) {
+      this.decorationEmitter.fire(changedDecorations);
+    }
+  }
+
+  statusFor(uri: vscode.Uri): SvnStatusEntry | undefined {
+    return this.statuses.get(pathKey(uri.fsPath))?.entry;
+  }
+
+  repositoryForUri(uri: vscode.Uri): SvnRepository | undefined {
+    const indexed = this.statuses.get(pathKey(uri.fsPath));
+    if (indexed) {
+      return indexed.repository;
+    }
+    return this.repositories.find(repository =>
+      isSameOrParentPath(repository.rootUri.fsPath, uri.fsPath));
   }
 
   resourceGroup(value: unknown): vscode.SourceControlResourceGroup | undefined {
@@ -85,7 +150,7 @@ export class SvnRepository implements vscode.Disposable, vscode.FileDecorationPr
 
   async createGroup(label: string, uris: readonly vscode.Uri[] = []): Promise<vscode.SourceControlResourceGroup> {
     const normalized = this.validatedGroupLabel(label);
-    const stored = { id: `custom-${createGroupId()}`, label: normalized };
+    const stored = { id: this.availableGroupId(), label: normalized };
     this.storedGroups.push(stored);
     const group = this.sourceControl.createResourceGroup(stored.id, stored.label);
     this.resourceGroups.set(stored.id, group);
@@ -139,34 +204,11 @@ export class SvnRepository implements vscode.Disposable, vscode.FileDecorationPr
     return stored ? this.resourceGroups.get(stored.id) : undefined;
   }
 
-  async refresh(): Promise<void> {
-    if (this.refreshing) {
-      return;
-    }
-    this.refreshing = true;
-    try {
-      const entries = await getSvnStatus(this.rootUri.fsPath, this.targets);
-      const nextStatuses = new Map<string, SvnStatusEntry>();
-      for (const entry of entries) {
-        nextStatuses.set(pathKey(entry.path), entry);
-      }
-      const changedDecorations = changedStatusUris(this.statuses, nextStatuses);
-
-      this.statuses = nextStatuses;
-      this.updateResourceGroups();
-      if (changedDecorations.length > 0) {
-        this.decorationEmitter.fire(changedDecorations);
-      }
-    } finally {
-      this.refreshing = false;
-    }
-  }
-
   provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
     if (uri.scheme !== 'file') {
       return undefined;
     }
-    const entry = this.statuses.get(pathKey(uri.fsPath));
+    const entry = this.statusFor(uri);
     if (!entry) {
       return undefined;
     }
@@ -185,6 +227,48 @@ export class SvnRepository implements vscode.Disposable, vscode.FileDecorationPr
     this.sourceControl.dispose();
   }
 
+  private migrateRepositoryGroups(): boolean {
+    let changed = false;
+    for (const repository of this.repositories) {
+      const repositoryKey = pathKey(repository.rootUri.fsPath);
+      if (this.migratedRepositories.has(repositoryKey)) {
+        continue;
+      }
+
+      const legacy = this.workspaceState.get<StoredGroupState>(
+        `${GROUP_STORAGE_PREFIX}${repository.rootUri.toString()}`);
+      const idMapping = new Map<string, string>();
+      for (const legacyGroup of sanitizeStoredGroups(legacy?.groups)) {
+        let stored = this.storedGroups.find(group =>
+          group.label.toLocaleLowerCase() === legacyGroup.label.toLocaleLowerCase());
+        if (!stored) {
+          const id = this.resourceGroups.has(legacyGroup.id)
+            ? this.availableGroupId()
+            : legacyGroup.id;
+          stored = { id, label: legacyGroup.label };
+          this.storedGroups.push(stored);
+          this.resourceGroups.set(id, this.sourceControl.createResourceGroup(id, stored.label));
+        }
+        idMapping.set(legacyGroup.id, stored.id);
+      }
+
+      for (const [relativePath, legacyGroupId] of Object.entries(sanitizeAssignments(legacy?.assignments))) {
+        const groupId = idMapping.get(legacyGroupId);
+        if (!groupId) {
+          continue;
+        }
+        const absolutePath = path.resolve(
+          repository.rootUri.fsPath,
+          relativePath.replace(/\//g, path.sep));
+        this.assignments[pathKey(absolutePath)] = groupId;
+      }
+
+      this.migratedRepositories.add(repositoryKey);
+      changed = true;
+    }
+    return changed;
+  }
+
   private createStoredResourceGroups(): void {
     for (const stored of this.storedGroups) {
       this.resourceGroups.set(stored.id, this.sourceControl.createResourceGroup(stored.id, stored.label));
@@ -196,15 +280,15 @@ export class SvnRepository implements vscode.Disposable, vscode.FileDecorationPr
       .map(uri => path.normalize(uri.fsPath))
       .filter(filePath => this.statuses.has(pathKey(filePath)));
     if (selectedPaths.length !== uris.length) {
-      throw new Error('所选差异文件不属于同一个 SVN 工作副本。');
+      throw new Error('所选文件不属于当前 SVN 改动。');
     }
-    const relatedPaths = [...this.statuses.values()]
+    const relatedPaths = this.statusEntries
       .filter(isVersionedChange)
       .map(entry => entry.path)
       .filter(filePath => selectedPaths.some(selected =>
         isSameOrParentPath(selected, filePath) || isSameOrParentPath(filePath, selected)));
     for (const filePath of relatedPaths) {
-      const assignment = this.assignmentKey(filePath);
+      const assignment = pathKey(filePath);
       if (group.id === DEFAULT_GROUP_ID) {
         delete this.assignments[assignment];
       } else {
@@ -218,11 +302,11 @@ export class SvnRepository implements vscode.Disposable, vscode.FileDecorationPr
     for (const id of this.resourceGroups.keys()) {
       statesByGroup.set(id, []);
     }
-    const entries = [...this.statuses.values()]
+    const entries = this.statusEntries
       .filter(isVersionedChange)
       .sort((left, right) => left.path.localeCompare(right.path));
     for (const entry of entries) {
-      const assignedId = this.assignments[this.assignmentKey(entry.path)];
+      const assignedId = this.assignments[pathKey(entry.path)];
       const groupId = assignedId && this.resourceGroups.has(assignedId) ? assignedId : DEFAULT_GROUP_ID;
       statesByGroup.get(groupId)!.push(this.toResourceState(entry));
     }
@@ -246,16 +330,21 @@ export class SvnRepository implements vscode.Disposable, vscode.FileDecorationPr
     return normalized;
   }
 
-  private assignmentKey(filePath: string): string {
-    const relative = path.relative(this.rootUri.fsPath, filePath).replace(/\\/g, '/');
-    return process.platform === 'win32' ? relative.toLowerCase() : relative;
+  private availableGroupId(): string {
+    let id: string;
+    do {
+      id = `custom-${createGroupId()}`;
+    } while (this.resourceGroups.has(id));
+    return id;
   }
 
   private persistGroups(): Thenable<void> {
-    return this.workspaceState.update(this.storageKey, {
+    return this.workspaceState.update(GLOBAL_GROUP_STORAGE_KEY, {
+      version: 2,
       groups: this.storedGroups,
-      assignments: this.assignments
-    } satisfies StoredGroupState);
+      assignments: this.assignments,
+      migratedRepositories: [...this.migratedRepositories]
+    } satisfies GlobalStoredGroupState);
   }
 
   private toResourceState(entry: SvnStatusEntry): vscode.SourceControlResourceState {
@@ -302,6 +391,19 @@ function sanitizeStoredGroups(value: unknown): StoredGroup[] {
   return groups;
 }
 
+function sanitizeAssignments(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  const assignments: Record<string, string> = {};
+  for (const [filePath, groupId] of Object.entries(value)) {
+    if (typeof groupId === 'string' && groupId.startsWith('custom-')) {
+      assignments[filePath] = groupId;
+    }
+  }
+  return assignments;
+}
+
 function createGroupId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -314,14 +416,14 @@ export function isVersionedChange(entry: SvnStatusEntry): boolean {
 }
 
 function changedStatusUris(
-  previous: Map<string, SvnStatusEntry>,
-  current: Map<string, SvnStatusEntry>
+  previous: Map<string, IndexedStatus>,
+  current: Map<string, IndexedStatus>
 ): vscode.Uri[] {
   const changed: vscode.Uri[] = [];
   const keys = new Set([...previous.keys(), ...current.keys()]);
   for (const key of keys) {
-    const before = previous.get(key);
-    const after = current.get(key);
+    const before = previous.get(key)?.entry;
+    const after = current.get(key)?.entry;
     if (before?.item !== after?.item || before?.props !== after?.props) {
       changed.push(vscode.Uri.file((after ?? before)!.path));
     }
