@@ -181,7 +181,7 @@ class RepositoryManager implements vscode.Disposable {
         if (rootResult.value) {
           addScope(scopesByRoot, rootResult.value, folderPath);
         }
-      } else {
+      } else if (!isNotWorkingCopyError(rootResult.reason)) {
         discoveryComplete = false;
         this.log(`ERROR 查询工作区所属工作副本失败：folder=${folderPath} error=${errorMessage(rootResult.reason)}`);
       }
@@ -1291,6 +1291,11 @@ function formatLineRanges(ranges: readonly LineRange[]): string {
 function pathKey(value: string): string {
   const normalized = path.normalize(value);
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function isNotWorkingCopyError(error: unknown): boolean {
+  const message = errorMessage(error);
+  return /not a working copy|not under version control|is not under version control|E155007|E155010/i.test(message);
 }
 
 function errorMessage(error: unknown): string {

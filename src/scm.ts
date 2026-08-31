@@ -51,6 +51,9 @@ export class SvnRepository {
     try {
       const entries = await getSvnStatus(this.rootUri.fsPath, this.targets);
       this.statuses = new Map(entries.map(entry => [pathKey(entry.path), entry]));
+    } catch (error) {
+      this.statuses.clear();
+      throw error;
     } finally {
       this.refreshing = false;
     }
@@ -94,7 +97,15 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
     this.createStoredResourceGroups();
     this.sourceControl.inputBox.visible = false;
     this.sourceControl.quickDiffProvider = {
-      provideOriginalResource: uri => createVirtualDocumentUri('svn-base', uri)
+      provideOriginalResource: uri => {
+        if (uri.scheme !== 'file' || !this.repositoryForUri(uri)) {
+          return undefined;
+        }
+        const entry = this.statusFor(uri);
+        return entry && isVersionedChange(entry)
+          ? createVirtualDocumentUri('svn-base', uri)
+          : undefined;
+      }
     };
     this.decorationRegistration = vscode.window.registerFileDecorationProvider(this);
     this.patchView = vscode.window.createTreeView(PATCH_VIEW_ID, {
@@ -285,11 +296,11 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
   }
 
   provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
-    if (uri.scheme !== 'file') {
+    if (uri.scheme !== 'file' || !this.repositoryForUri(uri)) {
       return undefined;
     }
     const entry = this.statusFor(uri);
-    if (!entry) {
+    if (!entry || !isVersionedChange(entry)) {
       return undefined;
     }
     const presentation = statusPresentation(entry.item, entry.props);
