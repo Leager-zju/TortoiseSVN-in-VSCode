@@ -5,6 +5,7 @@
   "version": "0.2.1",
   "publisher": "leager",
   "license": "MIT",
+  "icon": "resources/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/Leager-zju/TortoiseSVN-in-VSCode.git"
