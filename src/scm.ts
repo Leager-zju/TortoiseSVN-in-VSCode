@@ -1,3 +1,4 @@
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { getSvnStatus, SvnStatusEntry } from './svn';
@@ -16,6 +17,7 @@ type GlobalStoredGroupState = StoredGroupState & {
   version: 2;
   migratedRepositories: string[];
 };
+type StoredPatchRoots = Record<string, string>;
 type IndexedStatus = {
   entry: SvnStatusEntry;
   repository: SvnRepository;
@@ -25,6 +27,8 @@ const DEFAULT_GROUP_ID = 'changes';
 const DEFAULT_GROUP_LABEL = '默认分组';
 const GROUP_STORAGE_PREFIX = 'svn.resourceGroups.';
 const GLOBAL_GROUP_STORAGE_KEY = 'svn.resourceGroups.global.v2';
+const PATCH_ROOTS_STORAGE_KEY = 'svn.patches.roots.v1';
+const PATCH_VIEW_ID = 'svn.patchView';
 
 export class SvnRepository {
   private statuses = new Map<string, SvnStatusEntry>();
@@ -53,21 +57,34 @@ export class SvnRepository {
   }
 }
 
-export class SvnSourceControl implements vscode.Disposable, vscode.FileDecorationProvider {
+export class SvnSourceControl implements vscode.Disposable, vscode.FileDecorationProvider, vscode.TreeDataProvider<PatchTreeItem> {
   readonly sourceControl: vscode.SourceControl;
   readonly changes: vscode.SourceControlResourceGroup;
   private readonly decorationEmitter = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
   readonly onDidChangeFileDecorations = this.decorationEmitter.event;
+  private readonly patchEmitter = new vscode.EventEmitter<PatchTreeItem | undefined>();
+  readonly onDidChangeTreeData = this.patchEmitter.event;
   private readonly decorationRegistration: vscode.Disposable;
+  private readonly patchView: vscode.TreeView<PatchTreeItem>;
   private readonly resourceGroups = new Map<string, vscode.SourceControlResourceGroup>();
+  private readonly patchDirectory: vscode.Uri;
+  private readonly patchRoots: Map<string, string>;
+  private patchItems: PatchTreeItem[] = [];
   private readonly migratedRepositories: Set<string>;
   private storedGroups: StoredGroup[];
   private assignments: Record<string, string>;
   private repositories: SvnRepository[] = [];
   private statuses = new Map<string, IndexedStatus>();
 
-  constructor(private readonly workspaceState: vscode.Memento) {
-    this.sourceControl = vscode.scm.createSourceControl('svn', 'SVN Compass');
+  constructor(
+    private readonly workspaceState: vscode.Memento,
+    private readonly patchState: vscode.Memento,
+    patchDirectory: vscode.Uri
+  ) {
+    this.patchDirectory = patchDirectory;
+    this.patchRoots = new Map(Object.entries(
+      sanitizePatchRoots(patchState.get<StoredPatchRoots>(PATCH_ROOTS_STORAGE_KEY))));
+    this.sourceControl = vscode.scm.createSourceControl('svn', '更改');
     this.changes = this.sourceControl.createResourceGroup(DEFAULT_GROUP_ID, DEFAULT_GROUP_LABEL);
     this.resourceGroups.set(DEFAULT_GROUP_ID, this.changes);
     const stored = workspaceState.get<GlobalStoredGroupState>(GLOBAL_GROUP_STORAGE_KEY);
@@ -80,10 +97,73 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
       provideOriginalResource: uri => createVirtualDocumentUri('svn-base', uri)
     };
     this.decorationRegistration = vscode.window.registerFileDecorationProvider(this);
+    this.patchView = vscode.window.createTreeView(PATCH_VIEW_ID, {
+      treeDataProvider: this,
+      showCollapseAll: false
+    });
   }
 
   get statusEntries(): readonly SvnStatusEntry[] {
     return [...this.statuses.values()].map(value => value.entry);
+  }
+
+  getTreeItem(element: PatchTreeItem): vscode.TreeItem {
+    return element;
+  }
+
+  getChildren(): PatchTreeItem[] {
+    return this.patchItems;
+  }
+
+  async refreshPatches(): Promise<void> {
+    await fs.mkdir(this.patchDirectory.fsPath, { recursive: true });
+    const entries = await fs.readdir(this.patchDirectory.fsPath, { withFileTypes: true });
+    const files = entries
+      .filter(entry => entry.isFile() && isPatchFile(entry.name))
+      .map(entry => entry.name)
+      .sort((left, right) => left.localeCompare(right));
+    const fileNames = new Set(files);
+    for (const fileName of [...this.patchRoots.keys()]) {
+      if (!fileNames.has(fileName)) {
+        this.patchRoots.delete(fileName);
+      }
+    }
+    this.patchItems = files.map(fileName => new PatchTreeItem(
+      vscode.Uri.file(path.join(this.patchDirectory.fsPath, fileName)),
+      this.patchRoots.get(fileName)
+    ));
+    this.patchView.badge = files.length > 0
+      ? { value: files.length, tooltip: `${files.length} 个 Patch 文件` }
+      : undefined;
+    this.patchEmitter.fire(undefined);
+    await this.persistPatchRoots();
+  }
+
+  patchRoot(uri: vscode.Uri): string | undefined {
+    return this.patchRoots.get(path.basename(uri.fsPath));
+  }
+
+  get repositoryRoots(): readonly string[] {
+    return this.repositories.map(repository => repository.rootUri.fsPath);
+  }
+
+  patchFileUri(fileName: string): vscode.Uri {
+    return vscode.Uri.file(path.join(this.patchDirectory.fsPath, fileName));
+  }
+
+  isPatchUri(uri: vscode.Uri): boolean {
+    return uri.scheme === 'file' && pathKey(path.dirname(uri.fsPath)) === pathKey(this.patchDirectory.fsPath) &&
+      isPatchFile(path.basename(uri.fsPath));
+  }
+
+  async rememberPatch(uri: vscode.Uri, rootPath: string): Promise<void> {
+    this.patchRoots.set(path.basename(uri.fsPath), path.normalize(rootPath));
+    await this.persistPatchRoots();
+  }
+
+  async forgetPatch(uri: vscode.Uri): Promise<void> {
+    this.patchRoots.delete(path.basename(uri.fsPath));
+    await this.persistPatchRoots();
   }
 
   get groupLabels(): readonly string[] {
@@ -222,6 +302,8 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
   }
 
   dispose(): void {
+    this.patchView.dispose();
+    this.patchEmitter.dispose();
     this.decorationRegistration.dispose();
     this.decorationEmitter.dispose();
     this.sourceControl.dispose();
@@ -347,6 +429,13 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
     } satisfies GlobalStoredGroupState);
   }
 
+  private persistPatchRoots(): Thenable<void> {
+    return this.patchState.update(
+      PATCH_ROOTS_STORAGE_KEY,
+      Object.fromEntries(this.patchRoots) satisfies StoredPatchRoots
+    );
+  }
+
   private toResourceState(entry: SvnStatusEntry): vscode.SourceControlResourceState {
     const uri = vscode.Uri.file(entry.path);
     const presentation = statusPresentation(entry.item, entry.props);
@@ -363,6 +452,28 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
         tooltip: presentation.tooltip,
         strikeThrough: entry.item === 'deleted' || entry.item === 'missing'
       }
+    };
+  }
+}
+
+class PatchTreeItem extends vscode.TreeItem {
+  readonly contextValue = 'svn.patch';
+  readonly command: vscode.Command;
+  readonly iconPath = new vscode.ThemeIcon('file-code');
+
+  constructor(
+    readonly resourceUri: vscode.Uri,
+    rootPath: string | undefined
+  ) {
+    super(path.basename(resourceUri.fsPath), vscode.TreeItemCollapsibleState.None);
+    this.description = rootPath ? path.basename(rootPath) : undefined;
+    this.tooltip = rootPath
+      ? `${resourceUri.fsPath}\n工作副本：${rootPath}`
+      : `${resourceUri.fsPath}\n未记录工作副本`;
+    this.command = {
+      command: 'svn.openPatch',
+      title: '打开 Patch',
+      arguments: [this]
     };
   }
 }
@@ -402,6 +513,23 @@ function sanitizeAssignments(value: unknown): Record<string, string> {
     }
   }
   return assignments;
+}
+
+function sanitizePatchRoots(value: unknown): StoredPatchRoots {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  const roots: StoredPatchRoots = {};
+  for (const [fileName, rootPath] of Object.entries(value)) {
+    if (isPatchFile(fileName) && typeof rootPath === 'string' && rootPath.trim()) {
+      roots[fileName] = path.normalize(rootPath);
+    }
+  }
+  return roots;
+}
+
+function isPatchFile(fileName: string): boolean {
+  return /\.(patch|diff)$/i.test(fileName);
 }
 
 function createGroupId(): string {

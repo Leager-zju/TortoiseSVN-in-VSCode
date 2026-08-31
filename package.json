@@ -2,7 +2,7 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "leager",
   "license": "MIT",
   "repository": {
@@ -15,6 +15,12 @@
   },
   "engines": {
     "vscode": "^1.96.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "该扩展会调用本机 SVN 和 TortoiseSVN 可执行文件，仅在受信任工作区中启用。"
+    }
   },
   "categories": [
     "SCM Providers"
@@ -66,6 +72,36 @@
         "title": "回退此差异",
         "category": "SVN",
         "icon": "$(discard)"
+      },
+      {
+        "command": "svn.createPatch",
+        "title": "创建 Patch",
+        "category": "SVN",
+        "icon": "$(file-add)"
+      },
+      {
+        "command": "svn.createPatchGroup",
+        "title": "创建 Patch",
+        "category": "SVN",
+        "icon": "$(file-add)"
+      },
+      {
+        "command": "svn.openPatch",
+        "title": "打开 Patch",
+        "category": "SVN",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "svn.applyPatch",
+        "title": "Apply",
+        "category": "SVN",
+        "icon": "$(play)"
+      },
+      {
+        "command": "svn.removePatch",
+        "title": "Remove",
+        "category": "SVN",
+        "icon": "$(trash)"
       },
       {
         "command": "svn.openFile",
@@ -146,6 +182,17 @@
         "label": "移动到分组"
       }
     ],
+    "views": {
+      "scm": [
+        {
+          "id": "svn.patchView",
+          "name": "Patch",
+          "type": "tree",
+          "icon": "$(diff)",
+          "visibility": "visible"
+        }
+      ]
+    },
     "menus": {
       "explorer/context": [
         {
@@ -242,6 +289,26 @@
           "when": "false"
         },
         {
+          "command": "svn.createPatch",
+          "when": "false"
+        },
+        {
+          "command": "svn.openPatch",
+          "when": "false"
+        },
+        {
+          "command": "svn.applyPatch",
+          "when": "false"
+        },
+        {
+          "command": "svn.removePatch",
+          "when": "false"
+        },
+        {
+          "command": "svn.createPatchGroup",
+          "when": "false"
+        },
+        {
           "command": "svn.moveToNewGroup",
           "when": "false"
         },
@@ -287,8 +354,18 @@
         },
         {
           "command": "svn.revert",
-          "when": "scmProvider == svn && scmResourceState == svn.changed && isWindows",
+          "when": "scmProvider == svn && scmResourceState == svn.changed",
           "group": "inline@3"
+        },
+        {
+          "command": "svn.revert",
+          "when": "scmProvider == svn && scmResourceState == svn.changed",
+          "group": "navigation@3"
+        },
+        {
+          "command": "svn.createPatch",
+          "when": "scmProvider == svn && scmResourceState == svn.changed",
+          "group": "navigation@4"
         },
         {
           "submenu": "svn.moveToGroup",
@@ -297,18 +374,30 @@
         },
         {
           "command": "svn.commit",
-          "when": "scmProvider == svn && isWindows",
+          "when": "scmProvider == svn && scmResourceState == svn.changed && isWindows",
           "group": "navigation@2"
         },
         {
           "command": "svn.log",
-          "when": "scmProvider == svn",
-          "group": "navigation@3"
+          "when": "scmProvider == svn && scmResourceState == svn.changed",
+          "group": "navigation@5"
         },
         {
           "command": "svn.createCodeReview",
           "when": "scmProvider == svn && scmResourceState == svn.changed && isWindows",
-          "group": "navigation@4"
+          "group": "navigation@6"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "svn.applyPatch",
+          "when": "view == svn.patchView && viewItem == svn.patch",
+          "group": "navigation@1"
+        },
+        {
+          "command": "svn.removePatch",
+          "when": "view == svn.patchView && viewItem == svn.patch",
+          "group": "navigation@2"
         }
       ],
       "svn.moveToGroup": [
@@ -335,9 +424,14 @@
           "group": "1_actions@2"
         },
         {
+          "command": "svn.createPatchGroup",
+          "when": "scmProvider == svn",
+          "group": "1_actions@3"
+        },
+        {
           "command": "svn.createCodeReviewGroup",
           "when": "scmProvider == svn && isWindows",
-          "group": "1_actions@3"
+          "group": "1_actions@4"
         },
         {
           "command": "svn.renameGroup",

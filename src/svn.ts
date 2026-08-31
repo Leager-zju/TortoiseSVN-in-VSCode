@@ -1,5 +1,6 @@
 import {XMLParser} from 'fast-xml-parser';
 import {ChildProcess, execFile, spawn} from 'node:child_process';
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 
@@ -323,6 +324,24 @@ export async function revertSvnTargets(targets: string[]): Promise<void> {
   }
   const cwd = path.dirname(targets[0]);
   await runSvn(['revert', '--', ...targets.map(withPegEscape)], cwd);
+}
+
+export async function createSvnPatch(
+  targets: string[],
+  patchPath: string,
+  cwd: string
+): Promise<void> {
+  if (targets.length === 0) {
+    throw new Error('没有可创建 Patch 的文件。');
+  }
+  const relativeTargets = targets.map(target =>
+    (path.relative(cwd, target) || '.').split(path.sep).join('/'));
+  const content = await runSvn(['diff', '--', ...relativeTargets], cwd);
+  await fs.writeFile(patchPath, content, 'utf8');
+}
+
+export async function applySvnPatch(patchPath: string, cwd: string): Promise<void> {
+  await runSvn(['patch', patchPath], cwd);
 }
 
 export function launchTortoise(

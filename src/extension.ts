@@ -5,6 +5,8 @@ import { SvnLogViewer } from './logView';
 import { createVirtualDocumentUri, isVersionedChange, SvnRepository, SvnSourceControl } from './scm';
 import { SelectionHistoryLine, SvnSelectionHistoryViewer } from './selectionHistoryView';
 import {
+  applySvnPatch,
+  createSvnPatch,
   findWorkingCopyRoot,
   getBaseContent,
   getRevisionContent,
@@ -69,12 +71,17 @@ class RepositoryManager implements vscode.Disposable {
   private readonly selectionHistoryRequests = new Map<string, number>();
 
   constructor(private readonly context: vscode.ExtensionContext) {
-    this.sourceControl = new SvnSourceControl(context.workspaceState);
+    this.sourceControl = new SvnSourceControl(
+      context.workspaceState,
+      context.globalState,
+      vscode.Uri.joinPath(context.globalStorageUri, 'patches')
+    );
     context.subscriptions.push(this.output);
   }
 
   async initialize(): Promise<void> {
     this.registerCommands();
+    await this.sourceControl.refreshPatches();
     this.registerEvents();
     this.restartAutoRefresh();
     await this.discoverRepositories();
@@ -111,7 +118,10 @@ class RepositoryManager implements vscode.Disposable {
         }
       }
     });
-    await this.updateResourceContexts();
+    await Promise.all([
+      this.updateResourceContexts(),
+      this.sourceControl.refreshPatches()
+    ]);
   }
 
   scheduleRefresh(): void {
@@ -314,6 +324,11 @@ class RepositoryManager implements vscode.Disposable {
     register('svn.selectionHistory', first => this.showSelectionHistory(first));
     register('svn.revert', (...values) => this.confirmAndRevert(commandUris(...values)));
     register('svn.revertChange', (uri, changes, index) => this.revertChange(uri, changes, index));
+    register('svn.createPatch', (...values) => this.createPatch(commandUris(...values)));
+    register('svn.createPatchGroup', group => this.createGroupPatch(group));
+    register('svn.openPatch', first => this.openPatch(toUri(first)));
+    register('svn.applyPatch', first => this.applyPatch(toUri(first)));
+    register('svn.removePatch', first => this.removePatch(toUri(first)));
     register('svn.add', (...values) => this.runNative(
       'add',
       commandUris(...values),
@@ -569,6 +584,155 @@ class RepositoryManager implements vscode.Disposable {
       await this.refreshAll(true);
     } catch (error) {
       void vscode.window.showErrorMessage(`SVN 回退失败：${errorMessage(error)}`);
+    }
+  }
+
+  private createGroupPatch(value: unknown): Promise<void> | undefined {
+    const group = this.sourceControl.resourceGroup(value);
+    if (!group) {
+      return undefined;
+    }
+    return this.createPatch(
+      this.sourceControl.groupTargets(group).map(filePath => vscode.Uri.file(filePath))
+    );
+  }
+
+  private async createPatch(uris: vscode.Uri[]): Promise<void> {
+    const resources = uris.filter(uri => uri.scheme === 'file');
+    const targets = resources
+      .filter(uri => {
+        const status = this.statusFor(uri);
+        return status !== undefined && isVersionedChange(status);
+      })
+      .map(uri => uri.fsPath);
+    if (targets.length === 0) {
+      void vscode.window.showInformationMessage('所选资源没有可创建 Patch 的 SVN 本地改动。');
+      return;
+    }
+    const repositories = new Map<string, { root: string; targets: string[] }>();
+    for (const target of targets) {
+      const repository = this.sourceControl.repositoryForUri(vscode.Uri.file(target));
+      if (!repository) {
+        continue;
+      }
+      const key = pathKey(repository.rootUri.fsPath);
+      const item = repositories.get(key) ?? { root: repository.rootUri.fsPath, targets: [] };
+      item.targets.push(target);
+      repositories.set(key, item);
+    }
+    if (repositories.size !== 1) {
+      void vscode.window.showWarningMessage('创建 Patch 时请选择同一个 SVN 工作副本中的文件。');
+      return;
+    }
+    const repository = [...repositories.values()][0];
+    const input = await vscode.window.showInputBox({
+      title: '创建 SVN Patch',
+      prompt: '输入 Patch 文件名',
+      value: `svn-${new Date().toISOString().replace(/[:.]/g, '-')}.patch`,
+      ignoreFocusOut: true
+    });
+    if (input === undefined) {
+      return;
+    }
+    const fileName = normalizePatchFileName(input);
+    if (!fileName) {
+      void vscode.window.showWarningMessage('Patch 文件名只能包含普通文件名，且扩展名必须为 .patch 或 .diff。');
+      return;
+    }
+    let patchUri = this.sourceControl.patchFileUri(fileName);
+    let suffix = 1;
+    while (await fileExists(patchUri.fsPath)) {
+      const extension = path.extname(fileName);
+      const stem = fileName.slice(0, -extension.length);
+      patchUri = this.sourceControl.patchFileUri(`${stem}-${suffix}${extension}`);
+      suffix += 1;
+    }
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `正在创建 ${path.basename(patchUri.fsPath)}…` },
+        () => createSvnPatch(repository.targets, patchUri.fsPath, repository.root)
+      );
+      await this.sourceControl.rememberPatch(patchUri, repository.root);
+      await this.sourceControl.refreshPatches();
+      void vscode.window.showInformationMessage(`Patch 已创建：${path.basename(patchUri.fsPath)}`);
+    } catch (error) {
+      void vscode.window.showErrorMessage(`创建 Patch 失败：${errorMessage(error)}`);
+    }
+  }
+
+  private async openPatch(uri: vscode.Uri | undefined): Promise<void> {
+    if (!uri || !this.sourceControl.isPatchUri(uri)) {
+      void vscode.window.showWarningMessage('无法确定要打开的 Patch 文件。');
+      return;
+    }
+    await vscode.commands.executeCommand('vscode.open', uri);
+  }
+
+  private async applyPatch(uri: vscode.Uri | undefined): Promise<void> {
+    if (!uri || !this.sourceControl.isPatchUri(uri)) {
+      void vscode.window.showWarningMessage('无法确定要应用的 Patch 文件。');
+      return;
+    }
+    const repositoryRoots = this.sourceControl.repositoryRoots;
+    const storedRoot = this.sourceControl.patchRoot(uri);
+    let root = storedRoot && repositoryRoots.find(candidate => pathKey(candidate) === pathKey(storedRoot));
+    if (!root) {
+      if (repositoryRoots.length === 0) {
+        void vscode.window.showWarningMessage('当前工作区中没有可应用该 Patch 的 SVN 工作副本。');
+        return;
+      }
+      const selected = await vscode.window.showQuickPick(
+        repositoryRoots.map(candidate => ({
+          label: path.basename(candidate),
+          description: candidate,
+          root: candidate
+        })),
+        {
+          title: `选择应用 ${path.basename(uri.fsPath)} 的 SVN 工作副本`,
+          placeHolder: storedRoot
+            ? `原工作副本当前未打开：${storedRoot}`
+            : '该 Patch 未记录工作副本，请选择应用位置',
+          ignoreFocusOut: true
+        }
+      );
+      if (!selected) {
+        return;
+      }
+      root = selected.root;
+      await this.sourceControl.rememberPatch(uri, root);
+      await this.sourceControl.refreshPatches();
+    }
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `正在应用 ${path.basename(uri.fsPath)}…` },
+        () => applySvnPatch(uri.fsPath, root)
+      );
+      await this.refreshAll(true);
+      void vscode.window.showInformationMessage(`Patch 已应用：${path.basename(uri.fsPath)}`);
+    } catch (error) {
+      void vscode.window.showErrorMessage(`应用 Patch 失败：${errorMessage(error)}`);
+    }
+  }
+
+  private async removePatch(uri: vscode.Uri | undefined): Promise<void> {
+    if (!uri || !this.sourceControl.isPatchUri(uri)) {
+      void vscode.window.showWarningMessage('无法确定要移除的 Patch 文件。');
+      return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `是否移除 Patch 文件“${path.basename(uri.fsPath)}”？此操作不会回退已应用的修改。`,
+      { modal: true },
+      '移除 Patch'
+    );
+    if (choice !== '移除 Patch') {
+      return;
+    }
+    try {
+      await fs.rm(uri.fsPath, { force: true });
+      await this.sourceControl.forgetPatch(uri);
+      await this.sourceControl.refreshPatches();
+    } catch (error) {
+      void vscode.window.showErrorMessage(`移除 Patch 失败：${errorMessage(error)}`);
     }
   }
 
@@ -921,6 +1085,23 @@ function documentEol(documentOrEol: vscode.TextDocument | vscode.EndOfLine): str
 
 function endsWithLineBreak(content: string): boolean {
   return /[\r\n]$/.test(content);
+}
+
+function normalizePatchFileName(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed || path.basename(trimmed) !== trimmed || trimmed === '.' || trimmed === '..') {
+    return undefined;
+  }
+  return /\.(patch|diff)$/i.test(trimmed) ? trimmed : `${trimmed}.patch`;
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function commandUris(...values: unknown[]): vscode.Uri[] {
