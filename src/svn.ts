@@ -198,6 +198,42 @@ export async function getSvnLog(
     withPegEscape(targetPath)
   ];
   const output = await runSvn(args, path.dirname(targetPath));
+  const parsed = parseSvnLogEntries(output);
+  const hasMore = parsed.length > pageSize;
+  const entries = parsed.slice(0, pageSize);
+  const lastRevision = entries.at(-1)?.revision;
+  return {
+    entries,
+    hasMore,
+    nextRevision: hasMore && lastRevision && lastRevision > 1 ? lastRevision - 1 : undefined
+  };
+}
+
+export async function getSvnRevisionLog(
+  targetPath: string,
+  revision: number
+): Promise<SvnLogEntry | undefined> {
+  if (!Number.isInteger(revision) || revision <= 0) {
+    return undefined;
+  }
+  const output = await runSvn(
+    [
+      'log',
+      '--xml',
+      '--verbose',
+      '--limit',
+      '1',
+      '-r',
+      `${revision}:${revision}`,
+      '--',
+      withPegEscape(targetPath)
+    ],
+    path.dirname(targetPath)
+  );
+  return parseSvnLogEntries(output)[0];
+}
+
+function parseSvnLogEntries(output: string): SvnLogEntry[] {
   const document = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: '',
@@ -227,7 +263,7 @@ export async function getSvnLog(
     };
   };
 
-  const parsed = asArray(document.log?.logentry).map(entry => ({
+  return asArray(document.log?.logentry).map(entry => ({
     revision: Number(entry.revision ?? 0),
     author: String(entry.author ?? ''),
     date: String(entry.date ?? ''),
@@ -247,15 +283,6 @@ export async function getSvnLog(
       };
     })
   })).filter(entry => Number.isFinite(entry.revision) && entry.revision > 0);
-
-  const hasMore = parsed.length > pageSize;
-  const entries = parsed.slice(0, pageSize);
-  const lastRevision = entries.at(-1)?.revision;
-  return {
-    entries,
-    hasMore,
-    nextRevision: hasMore && lastRevision && lastRevision > 1 ? lastRevision - 1 : undefined
-  };
 }
 
 export async function getSvnBlame(filePath: string): Promise<SvnBlameLine[]> {

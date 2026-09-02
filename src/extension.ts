@@ -1,6 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { blameLineNumber, SvnBlameAnnotator } from './blame';
 import { SvnLogViewer } from './logView';
 import { createVirtualDocumentUri, isVersionedChange, SvnRepository, SvnSourceControl } from './scm';
 import { SelectionHistoryLine, SvnSelectionHistoryViewer } from './selectionHistoryView';
@@ -62,6 +63,7 @@ class RepositoryManager implements vscode.Disposable {
   private readonly output = vscode.window.createOutputChannel('SVN');
   private readonly logViewer = new SvnLogViewer();
   private readonly selectionHistoryViewer = new SvnSelectionHistoryViewer();
+  private readonly blameAnnotator = new SvnBlameAnnotator();
   private readonly sourceControl: SvnSourceControl;
   private refreshTimer: NodeJS.Timeout | undefined;
   private refreshDebounce: NodeJS.Timeout | undefined;
@@ -76,7 +78,7 @@ class RepositoryManager implements vscode.Disposable {
       context.globalState,
       vscode.Uri.joinPath(context.globalStorageUri, 'patches')
     );
-    context.subscriptions.push(this.output);
+    context.subscriptions.push(this.output, this.blameAnnotator);
   }
 
   async initialize(): Promise<void> {
@@ -322,6 +324,7 @@ class RepositoryManager implements vscode.Disposable {
       this.logViewer.show(uri);
     });
     register('svn.selectionHistory', first => this.showSelectionHistory(first));
+    register('svn.blameLine', (...values) => this.blameLine(values));
     register('svn.revert', (...values) => this.confirmAndRevert(commandUris(...values)));
     register('svn.revertChange', (uri, changes, index) => this.revertChange(uri, changes, index));
     register('svn.createPatch', (...values) => this.createPatch(commandUris(...values)));
@@ -348,6 +351,24 @@ class RepositoryManager implements vscode.Disposable {
     register('svn.commitGroup', group => this.runGroupNative('commit', group));
     register('svn.revertGroup', group => this.revertGroup(group));
     register('svn.createCodeReviewGroup', group => this.runGroupNative('gfcreatecr', group));
+  }
+
+  private async blameLine(values: unknown[]): Promise<void> {
+    const uri = commandUris(...values)[0];
+    const editor = (uri ? this.visibleEditor(uri) : undefined) ?? vscode.window.activeTextEditor;
+    if (!editor || editor.document.uri.scheme !== 'file') {
+      void vscode.window.showWarningMessage('请在本地文件编辑器中查看 Blame 信息。');
+      return;
+    }
+    // 行号右键菜单可能把行号作为参数传入，否则回落到光标所在行。
+    const line = blameLineNumber(values) ?? editor.selection.active.line;
+    await this.blameAnnotator.toggle(editor, line);
+  }
+
+  private visibleEditor(uri: vscode.Uri): vscode.TextEditor | undefined {
+    const key = uri.toString();
+    return vscode.window.visibleTextEditors.find(
+      editor => editor.document.uri.toString() === key);
   }
 
   private async showSelectionHistory(contextValue: unknown): Promise<void> {
@@ -526,6 +547,7 @@ class RepositoryManager implements vscode.Disposable {
         return;
       }
       const changeEdit = createRevertChangeEdit(baseContent, document, changes[index]);
+      const viewState = captureRevertViewState(editor, changeEdit.range);
       const edit = new vscode.WorkspaceEdit();
       edit.replace(uri, changeEdit.range, changeEdit.text);
       if (!await vscode.workspace.applyEdit(edit)) {
@@ -534,6 +556,7 @@ class RepositoryManager implements vscode.Disposable {
       if (!await document.save()) {
         throw new Error('文件保存失败。');
       }
+      restoreRevertViewState(editor, changeEdit.range.start, viewState);
       await this.refreshAll(true);
     } catch (error) {
       void vscode.window.showErrorMessage(`SVN 差异回退失败：${errorMessage(error)}`);
@@ -952,6 +975,50 @@ type RevertChangeEdit = {
   range: vscode.Range;
   text: string;
 };
+
+type RevertViewState = {
+  selections: vscode.Selection[];
+  insideChange: boolean[];
+  topLine: number;
+};
+
+function captureRevertViewState(editor: vscode.TextEditor, range: vscode.Range): RevertViewState {
+  return {
+    selections: editor.selections.map(selection => new vscode.Selection(selection.anchor, selection.active)),
+    insideChange: editor.selections.map(selection =>
+      selection.start.isBeforeOrEqual(range.end) && selection.end.isAfterOrEqual(range.start)),
+    topLine: editor.visibleRanges[0]?.start.line ?? 0
+  };
+}
+
+function restoreRevertViewState(
+  editor: vscode.TextEditor,
+  anchor: vscode.Position,
+  state: RevertViewState
+): void {
+  const document = editor.document;
+  if (document.isClosed || document.lineCount === 0) {
+    return;
+  }
+  const maxLine = document.lineCount - 1;
+  const clamp = (position: vscode.Position): vscode.Position => {
+    const line = Math.min(Math.max(position.line, 0), maxLine);
+    const character = Math.min(Math.max(position.character, 0), document.lineAt(line).text.length);
+    return new vscode.Position(line, character);
+  };
+
+  // 回退后把光标收回到被回退的文本块起点，避免它滑到编辑末尾而落到相邻差异上。
+  const cursor = clamp(anchor);
+  editor.selections = state.selections.map((selection, order) => state.insideChange[order]
+    ? new vscode.Selection(cursor, cursor)
+    : new vscode.Selection(clamp(selection.anchor), clamp(selection.active)));
+
+  const topLine = Math.min(Math.max(state.topLine, 0), maxLine);
+  const currentTop = editor.visibleRanges[0]?.start.line ?? 0;
+  if (currentTop !== topLine) {
+    editor.revealRange(new vscode.Range(topLine, 0, topLine, 0), vscode.TextEditorRevealType.AtTop);
+  }
+}
 
 function createRevertChangeEdit(
   original: string,
