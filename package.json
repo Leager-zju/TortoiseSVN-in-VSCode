@@ -2,7 +2,7 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "publisher": "leager",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -40,19 +40,19 @@
     "commands": [
       {
         "command": "svn.update",
-        "title": "SVN 更新",
+        "title": "更新",
         "category": "SVN",
         "icon": "$(sync)"
       },
       {
         "command": "svn.commit",
-        "title": "SVN 提交",
+        "title": "提交",
         "category": "SVN",
         "icon": "$(check)"
       },
       {
         "command": "svn.log",
-        "title": "SVN 日志",
+        "title": "日志",
         "category": "SVN",
         "icon": "$(history)"
       },
@@ -70,7 +70,7 @@
       },
       {
         "command": "svn.revert",
-        "title": "SVN 回退",
+        "title": "回退",
         "category": "SVN",
         "icon": "$(discard)"
       },
@@ -118,13 +118,13 @@
       },
       {
         "command": "svn.diff",
-        "title": "SVN Diff",
+        "title": "Diff",
         "category": "SVN",
         "icon": "$(diff)"
       },
       {
         "command": "svn.add",
-        "title": "SVN 加入版本管理",
+        "title": "加入版本管理",
         "category": "SVN",
         "icon": "$(add)"
       },
@@ -186,7 +186,11 @@
     "submenus": [
       {
         "id": "svn.moveToGroup",
-        "label": "移动到分组"
+        "label": "选择分组"
+      },
+      {
+        "id": "svn.operations",
+        "label": "SVN操作"
       }
     ],
     "views": {
@@ -203,71 +207,21 @@
     "menus": {
       "explorer/context": [
         {
-          "command": "svn.update",
-          "when": "resourceScheme == file && isWindows",
-          "group": "svn@1"
-        },
-        {
-          "command": "svn.commit",
-          "when": "resourceScheme == file && isWindows",
-          "group": "svn@2"
-        },
-        {
-          "command": "svn.log",
+          "submenu": "svn.operations",
           "when": "resourceScheme == file",
-          "group": "svn@3"
-        },
-        {
-          "command": "svn.revert",
-          "when": "resourceScheme == file && isWindows && resourcePath in svn.changedResourcePaths",
-          "group": "svn@4"
-        },
-        {
-          "command": "svn.diff",
-          "when": "resourceScheme == file && resourcePath in svn.changedResourcePaths",
-          "group": "svn@5"
-        },
-        {
-          "command": "svn.add",
-          "when": "resourceScheme == file && isWindows && resourcePath in svn.unversionedResourcePaths",
-          "group": "svn@6"
+          "group": "1_svn@1"
         }
       ],
       "editor/context": [
         {
-          "command": "svn.update",
-          "when": "resourceScheme == file && isWindows",
-          "group": "svn@1"
-        },
-        {
-          "command": "svn.commit",
-          "when": "resourceScheme == file && isWindows",
-          "group": "svn@2"
-        },
-        {
-          "command": "svn.log",
-          "when": "resourceScheme == file",
-          "group": "svn@3"
-        },
-        {
           "command": "svn.selectionHistory",
           "when": "resourceScheme == file && editorHasSelection",
-          "group": "svn@3.5"
+          "group": "0_svn@1"
         },
         {
-          "command": "svn.revert",
-          "when": "resourceScheme == file && isWindows && resourcePath in svn.changedResourcePaths",
-          "group": "svn@4"
-        },
-        {
-          "command": "svn.diff",
-          "when": "resourceScheme == file && resourcePath in svn.changedResourcePaths",
-          "group": "svn@5"
-        },
-        {
-          "command": "svn.add",
-          "when": "resourceScheme == file && isWindows && resourcePath in svn.unversionedResourcePaths",
-          "group": "svn@6"
+          "submenu": "svn.operations",
+          "when": "resourceScheme == file",
+          "group": "0_svn@2"
         }
       ],
       "editor/lineNumber/context": [
@@ -372,34 +326,14 @@
           "group": "inline@3"
         },
         {
-          "command": "svn.revert",
-          "when": "scmProvider == svn && scmResourceState == svn.changed",
-          "group": "navigation@3"
-        },
-        {
-          "command": "svn.createPatch",
-          "when": "scmProvider == svn && scmResourceState == svn.changed",
-          "group": "navigation@4"
-        },
-        {
           "submenu": "svn.moveToGroup",
           "when": "scmProvider == svn && scmResourceState == svn.changed",
-          "group": "navigation@1"
+          "group": "1_group@1"
         },
         {
-          "command": "svn.commit",
-          "when": "scmProvider == svn && scmResourceState == svn.changed && isWindows",
-          "group": "navigation@2"
-        },
-        {
-          "command": "svn.log",
-          "when": "scmProvider == svn && scmResourceState == svn.changed",
-          "group": "navigation@5"
-        },
-        {
-          "command": "svn.createCodeReview",
-          "when": "scmProvider == svn && scmResourceState == svn.changed && isWindows",
-          "group": "navigation@6"
+          "submenu": "svn.operations",
+          "when": "scmProvider == svn",
+          "group": "2_svn@1"
         }
       ],
       "view/item/context": [
@@ -424,6 +358,47 @@
           "command": "svn.moveToExistingGroup",
           "when": "scmProvider == svn",
           "group": "2_groups@1"
+        }
+      ],
+      "svn.operations": [
+        {
+          "command": "svn.update",
+          "when": "isWindows",
+          "group": "1_svn@1"
+        },
+        {
+          "command": "svn.commit",
+          "when": "isWindows",
+          "group": "1_svn@2"
+        },
+        {
+          "command": "svn.revert",
+          "when": "isWindows && (resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed)",
+          "group": "1_svn@3"
+        },
+        {
+          "command": "svn.log",
+          "group": "1_svn@4"
+        },
+        {
+          "command": "svn.diff",
+          "when": "resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed",
+          "group": "1_svn@5"
+        },
+        {
+          "command": "svn.createPatch",
+          "when": "resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed",
+          "group": "1_svn@6"
+        },
+        {
+          "command": "svn.createCodeReview",
+          "when": "isWindows && (resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed)",
+          "group": "1_svn@7"
+        },
+        {
+          "command": "svn.add",
+          "when": "isWindows && resourcePath in svn.unversionedResourcePaths",
+          "group": "2_add@1"
         }
       ],
       "scm/resourceGroup/context": [
