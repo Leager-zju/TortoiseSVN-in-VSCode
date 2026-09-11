@@ -104,6 +104,9 @@ class SvnLogPanel implements vscode.Disposable {
         case 'compareWorking':
           await this.compareWorking(value.revision);
           break;
+        case 'compareCurrent':
+          await this.compareCurrent(value.revision);
+          break;
         case 'showChanges':
           await this.showChanges(value.revision);
           break;
@@ -208,6 +211,26 @@ class SvnLogPanel implements vscode.Disposable {
     await vscode.commands.executeCommand(
         'vscode.diff', revisionUri(this.targetUri, revision), this.targetUri,
         `${path.basename(this.targetUri.fsPath)}（r${revision} ↔ 工作副本）`);
+  }
+
+  private async compareCurrent(revision: number|undefined): Promise<void> {
+    if (!revision || !this.ensureFileTarget()) {
+      return;
+    }
+    const current = Number(this.targetInfo?.revision);
+    if (!Number.isInteger(current) || current <= 0) {
+      void vscode.window.showInformationMessage('无法读取工作副本的当前版本号。');
+      return;
+    }
+    if (current === revision) {
+      void vscode.window.showInformationMessage(`r${revision} 就是当前版本，无需比较。`);
+      return;
+    }
+    await vscode.commands.executeCommand(
+        'vscode.diff', revisionUri(this.targetUri, revision),
+        revisionUri(this.targetUri, current),
+        `${path.basename(this.targetUri.fsPath)}（r${revision} ↔ 当前版本 r${
+            current}）`);
   }
 
   private ensureFileTarget(): boolean {
@@ -387,7 +410,11 @@ function logHtml(webview: vscode.Webview): string {
     .row-badge.pending { color: var(--vscode-gitDecoration-modifiedResourceForeground); }
     .commit-item:hover > .log-row { background: var(--vscode-list-hoverBackground); }
     .commit-item.selected > .log-row { color: var(--vscode-list-activeSelectionForeground); background: var(--vscode-list-activeSelectionBackground); }
-    .commit-details { margin-left: 42px; padding: 12px clamp(10px, 2vw, 22px) 16px; border-bottom: 1px solid var(--vscode-panel-border); border-left: 2px solid var(--vscode-textLink-foreground); background: var(--vscode-editor-inactiveSelectionBackground); }
+    .row-menu { position: fixed; z-index: 20; min-width: 210px; max-width: 90vw; padding: 4px 0; border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border)); background: var(--vscode-menu-background, var(--vscode-editor-background)); color: var(--vscode-menu-foreground, var(--vscode-foreground)); box-shadow: 0 2px 8px rgba(0, 0, 0, .36); }
+    .row-menu button { display: block; width: 100%; padding: 4px 12px; color: inherit; background: transparent; border: 0; border-radius: 0; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .row-menu button:hover:not(:disabled) { color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground)); background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground)); }
+    .row-menu button:disabled { opacity: .5; cursor: default; }
+    .commit-details { margin-left: 20px; padding: 12px clamp(10px, 2vw, 22px) 16px; border-bottom: 1px solid var(--vscode-panel-border); border-left: 2px solid var(--vscode-textLink-foreground); background: var(--vscode-editor-inactiveSelectionBackground); }
     .details-head { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 8px; color: var(--vscode-descriptionForeground); }
     .message { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 14px; line-height: 1.5; user-select: text; }
     .changes-title { margin: 0 0 7px; font-weight: 600; }
@@ -429,7 +456,7 @@ function logHtml(webview: vscode.Webview): string {
       .log-row > .date { display: none; }
       .commit-item .graph-cell::before { left: 16px; }
       .graph-node { left: 11px; }
-      .commit-details { margin-left: 34px; }
+      .commit-details { margin-left: 16px; }
       .copy-source { display: none; }
     }
   </style>
@@ -486,6 +513,7 @@ function logHtml(webview: vscode.Webview): string {
       <span><span id="summary"></span> <button id="loadMore" class="secondary" hidden>加载更多</button> <button id="loadAll" class="secondary" hidden>加载全部</button></span>
     </footer>
   </main>
+  <div id="rowMenu" class="row-menu" hidden></div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     let state = { entries: [], hasMore: false, loading: true };
@@ -582,6 +610,16 @@ function logHtml(webview: vscode.Webview): string {
         row.addEventListener('keydown', event => {
           if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(entry.revision, event.ctrlKey || event.metaKey); }
         });
+        row.addEventListener('contextmenu', event => {
+          event.preventDefault();
+          if (!selected.includes(entry.revision)) {
+            // 右键只选中、不展开详细信息。
+            selected = [entry.revision];
+            renderRows();
+            updateActions();
+          }
+          showRowMenu(event, entry.revision);
+        });
         item.appendChild(row);
         if (expandedRevision === entry.revision) item.appendChild(renderDetails(entry));
         rows.appendChild(item);
@@ -602,6 +640,43 @@ function logHtml(webview: vscode.Webview): string {
       renderRows();
       updateActions();
     }
+    function closeRowMenu() { byId('rowMenu').hidden = true; }
+    function menuItem(label, enabled, action, hint) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.textContent = label;
+      item.disabled = !enabled;
+      if (hint) item.title = hint;
+      item.onclick = event => { event.stopPropagation(); closeRowMenu(); action(); };
+      return item;
+    }
+    function showRowMenu(event, revision) {
+      const menu = byId('rowMenu');
+      const current = currentRevision();
+      const isFile = state.info?.kind === 'file';
+      const canCompare = isFile && current !== undefined && current !== revision;
+      const hint = canCompare
+        ? '在对比编辑器中比较所选版本与工作副本当前版本'
+        : isFile ? '所选版本就是工作副本的当前版本' : '目录日志不支持按文本比较修订';
+      menu.replaceChildren(menuItem(
+        '与当前版本比较（r' + revision + ' ↔ ' + (current !== undefined ? 'r' + current : '当前版本') + '）',
+        canCompare, () => send('compareCurrent', { revision }), hint));
+      menu.hidden = false;
+      const width = menu.offsetWidth || 220;
+      const height = menu.offsetHeight || 40;
+      menu.style.left = Math.max(4, Math.min(event.clientX, window.innerWidth - width - 4)) + 'px';
+      menu.style.top = Math.max(4, Math.min(event.clientY, window.innerHeight - height - 4)) + 'px';
+    }
+    document.addEventListener('click', closeRowMenu);
+    document.addEventListener('contextmenu', event => {
+      if (event.target && event.target.closest && event.target.closest('.log-row')) return;
+      closeRowMenu();
+    });
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') closeRowMenu(); });
+    window.addEventListener('blur', closeRowMenu);
+    window.addEventListener('resize', closeRowMenu);
+    byId('log-container').addEventListener('scroll', closeRowMenu);
+
     function changeTree(changes) {
       const root = { children: new Map() };
       const paths = changes.map(change => change.path.split('/').filter(Boolean));
