@@ -345,12 +345,26 @@ export async function getBaseContent(filePath: string): Promise<string> {
   return runSvn(['cat', '-r', 'BASE', '--', withPegEscape(filePath)], path.dirname(filePath));
 }
 
+
+
 export async function revertSvnTargets(targets: string[]): Promise<void> {
   if (targets.length === 0) {
     return;
   }
   const cwd = path.dirname(targets[0]);
   await runSvn(['revert', '--', ...targets.map(withPegEscape)], cwd);
+}
+
+export type SvnResolveAccept =
+    'working'|'base'|'mine-conflict'|'theirs-conflict'|'mine-full'|'theirs-full';
+
+export async function resolveSvnTargets(
+    targets: string[], accept: SvnResolveAccept = 'working'): Promise<void> {
+  if (targets.length === 0) {
+    return;
+  }
+  const cwd = path.dirname(targets[0]);
+  await runSvn(['resolve', '--accept', accept, '--', ...targets.map(withPegEscape)], cwd);
 }
 
 export async function createSvnPatch(
@@ -372,7 +386,7 @@ export async function applySvnPatch(patchPath: string, cwd: string): Promise<voi
 }
 
 export function launchTortoise(
-  command: 'update'|'commit'|'add'|'gfcreatecr', targets: string[]): ChildProcess {
+  command: 'update'|'commit'|'add'|'gfcreatecr'|'conflicteditor', targets: string[]): ChildProcess {
   if (process.platform !== 'win32') {
     throw new Error('TortoiseSVN 原生窗口仅支持 Windows。');
   }

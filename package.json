@@ -2,7 +2,7 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "publisher": "leager",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -79,6 +79,18 @@
         "title": "回退此差异",
         "category": "SVN",
         "icon": "$(discard)"
+      },
+      {
+        "command": "svn.resolve",
+        "title": "标记冲突已解决",
+        "category": "SVN",
+        "icon": "$(check)"
+      },
+      {
+        "command": "svn.openConflict",
+        "title": "处理冲突",
+        "category": "SVN",
+        "icon": "$(merge)"
       },
       {
         "command": "svn.createPatch",
@@ -201,6 +213,13 @@
           "type": "tree",
           "icon": "$(diff)",
           "visibility": "visible"
+        },
+        {
+          "id": "svn.conflictView",
+          "name": "冲突文件列表",
+          "type": "tree",
+          "icon": "$(warning)",
+          "visibility": "visible"
         }
       ]
     },
@@ -312,22 +331,22 @@
       "scm/resourceState/context": [
         {
           "command": "svn.openFile",
-          "when": "scmProvider == svn && scmResourceState == svn.changed",
+          "when": "scmProvider == svn && (scmResourceState == svn.changed || scmResourceState == svn.conflicted)",
           "group": "inline@1"
         },
         {
           "command": "svn.diff",
-          "when": "scmProvider == svn && scmResourceState == svn.changed",
+          "when": "scmProvider == svn && (scmResourceState == svn.changed || scmResourceState == svn.conflicted)",
           "group": "inline@2"
         },
         {
           "command": "svn.revert",
-          "when": "scmProvider == svn && scmResourceState == svn.changed",
+          "when": "scmProvider == svn && (scmResourceState == svn.changed || scmResourceState == svn.conflicted)",
           "group": "inline@3"
         },
         {
           "submenu": "svn.moveToGroup",
-          "when": "scmProvider == svn && scmResourceState == svn.changed",
+          "when": "scmProvider == svn && (scmResourceState == svn.changed || scmResourceState == svn.conflicted)",
           "group": "1_group@1"
         },
         {
@@ -346,6 +365,11 @@
           "command": "svn.removePatch",
           "when": "view == svn.patchView && viewItem == svn.patch",
           "group": "navigation@2"
+        },
+        {
+          "command": "svn.resolve",
+          "when": "view == svn.conflictView && viewItem == svn.conflict",
+          "group": "navigation@1"
         }
       ],
       "svn.moveToGroup": [
@@ -373,7 +397,7 @@
         },
         {
           "command": "svn.revert",
-          "when": "isWindows && (resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed)",
+          "when": "isWindows && (resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed || scmResourceState == svn.conflicted)",
           "group": "1_svn@3"
         },
         {
@@ -382,18 +406,23 @@
         },
         {
           "command": "svn.diff",
-          "when": "resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed",
+          "when": "resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed || scmResourceState == svn.conflicted",
           "group": "1_svn@5"
         },
         {
           "command": "svn.createPatch",
-          "when": "resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed",
+          "when": "resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed || scmResourceState == svn.conflicted",
           "group": "1_svn@6"
         },
         {
           "command": "svn.createCodeReview",
-          "when": "isWindows && (resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed)",
+          "when": "isWindows && (resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed || scmResourceState == svn.conflicted)",
           "group": "1_svn@7"
+        },
+        {
+          "command": "svn.resolve",
+          "when": "resourcePath in svn.conflictedResourcePaths || scmResourceState == svn.conflicted",
+          "group": "1_svn@8"
         },
         {
           "command": "svn.add",
@@ -434,6 +463,12 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "svn.conflictView",
+        "contents": "当前工作副本没有 SVN 冲突文件。"
+      }
+    ],
     "configuration": {
       "title": "SVN",
       "properties": {

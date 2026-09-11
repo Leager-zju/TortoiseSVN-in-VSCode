@@ -457,7 +457,7 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
         title: '打开 SVN Diff',
         arguments: [uri]
       },
-      contextValue: 'svn.changed',
+      contextValue: isConflicted(entry) ? 'svn.conflicted' : 'svn.changed',
       decorations: {
         iconPath: new vscode.ThemeIcon(presentation.icon, new vscode.ThemeColor(presentation.color)),
         tooltip: presentation.tooltip,
@@ -552,6 +552,10 @@ export function isVersionedChange(entry: SvnStatusEntry): boolean {
     return false;
   }
   return !['none', 'normal'].includes(entry.item) || !['none', 'normal'].includes(entry.props);
+}
+
+export function isConflicted(entry: SvnStatusEntry): boolean {
+  return entry.item === 'conflicted' || entry.props === 'conflicted';
 }
 
 function changedStatusUris(

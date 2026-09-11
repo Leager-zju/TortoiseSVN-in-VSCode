@@ -2,8 +2,15 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { blameLineNumber, SvnBlameAnnotator } from './blame';
+import { SvnConflictView } from './conflictView';
 import { SvnLogViewer } from './logView';
-import { createVirtualDocumentUri, isVersionedChange, SvnRepository, SvnSourceControl } from './scm';
+import {
+  createVirtualDocumentUri,
+  isConflicted,
+  isVersionedChange,
+  SvnRepository,
+  SvnSourceControl
+} from './scm';
 import { SelectionHistoryLine, SvnSelectionHistoryViewer } from './selectionHistoryView';
 import {
   applySvnPatch,
@@ -13,6 +20,7 @@ import {
   getRevisionContent,
   getSvnBlame,
   launchTortoise,
+  resolveSvnTargets,
   revertSvnTargets,
   SvnStatusEntry
 } from './svn';
@@ -64,6 +72,7 @@ class RepositoryManager implements vscode.Disposable {
   private readonly logViewer = new SvnLogViewer();
   private readonly selectionHistoryViewer = new SvnSelectionHistoryViewer();
   private readonly blameAnnotator = new SvnBlameAnnotator();
+  private readonly conflictView = new SvnConflictView();
   private readonly sourceControl: SvnSourceControl;
   private refreshTimer: NodeJS.Timeout | undefined;
   private refreshDebounce: NodeJS.Timeout | undefined;
@@ -78,7 +87,7 @@ class RepositoryManager implements vscode.Disposable {
       context.globalState,
       vscode.Uri.joinPath(context.globalStorageUri, 'patches')
     );
-    context.subscriptions.push(this.output, this.blameAnnotator);
+    context.subscriptions.push(this.output, this.blameAnnotator, this.conflictView);
   }
 
   async initialize(): Promise<void> {
@@ -124,6 +133,7 @@ class RepositoryManager implements vscode.Disposable {
       this.updateResourceContexts(),
       this.sourceControl.refreshPatches()
     ]);
+    this.conflictView.setEntries(this.sourceControl.statusEntries);
   }
 
   scheduleRefresh(): void {
@@ -237,6 +247,7 @@ class RepositoryManager implements vscode.Disposable {
   private async updateResourceContexts(): Promise<void> {
     const changedPaths = new Set<string>();
     const unversionedPaths = new Set<string>();
+    const conflictedPaths = new Set<string>();
     for (const entry of this.sourceControl.statusEntries) {
       const values = [vscode.Uri.file(entry.path).path, vscode.Uri.file(entry.path).fsPath];
       const target = entry.item === 'unversioned'
@@ -247,10 +258,14 @@ class RepositoryManager implements vscode.Disposable {
       if (target) {
         values.forEach(value => target.add(value));
       }
+      if (isConflicted(entry)) {
+        values.forEach(value => conflictedPaths.add(value));
+      }
     }
     await Promise.all([
       vscode.commands.executeCommand('setContext', 'svn.changedResourcePaths', [...changedPaths]),
-      vscode.commands.executeCommand('setContext', 'svn.unversionedResourcePaths', [...unversionedPaths])
+      vscode.commands.executeCommand('setContext', 'svn.unversionedResourcePaths', [...unversionedPaths]),
+      vscode.commands.executeCommand('setContext', 'svn.conflictedResourcePaths', [...conflictedPaths])
     ]);
   }
 
@@ -326,6 +341,8 @@ class RepositoryManager implements vscode.Disposable {
     register('svn.selectionHistory', first => this.showSelectionHistory(first));
     register('svn.blameLine', (...values) => this.blameLine(values));
     register('svn.revert', (...values) => this.confirmAndRevert(commandUris(...values)));
+    register('svn.resolve', (...values) => this.resolveConflicts(commandUris(...values)));
+    register('svn.openConflict', first => this.openConflictEditor(toUri(first)));
     register('svn.revertChange', (uri, changes, index) => this.revertChange(uri, changes, index));
     register('svn.createPatch', (...values) => this.createPatch(commandUris(...values)));
     register('svn.createPatchGroup', group => this.createGroupPatch(group));
@@ -607,6 +624,101 @@ class RepositoryManager implements vscode.Disposable {
       await this.refreshAll(true);
     } catch (error) {
       void vscode.window.showErrorMessage(`SVN 回退失败：${errorMessage(error)}`);
+    }
+  }
+
+  private async resolveConflicts(uris: vscode.Uri[]): Promise<void> {
+    const resources = uris.filter(uri => uri.scheme === 'file');
+    if (resources.length === 0) {
+      const active = vscode.window.activeTextEditor?.document.uri;
+      if (active?.scheme === 'file') {
+        resources.push(active);
+      }
+    }
+
+    const targets = resources
+      .filter(uri => {
+        const status = this.statusFor(uri);
+        return status !== undefined && isConflicted(status);
+      })
+      .map(uri => uri.fsPath);
+    if (targets.length === 0) {
+      void vscode.window.showInformationMessage('所选资源没有处于冲突状态，无需解决冲突。');
+      return;
+    }
+
+    const singleFile = targets.length === 1;
+    const detail = singleFile
+      ? `将把“${path.basename(targets[0])}”的当前内容标记为冲突已解决，并删除 .mine / .r* 临时文件。请先确认文件中的冲突标记已经处理完毕。`
+      : `将把所选 ${targets.length} 个文件的当前内容标记为冲突已解决，并删除 .mine / .r* 临时文件。请先确认文件中的冲突标记已经处理完毕。`;
+    const choice = await vscode.window.showWarningMessage(detail, { modal: true }, '标记为已解决');
+    if (!choice) {
+      return;
+    }
+
+    try {
+      // --accept working 采用磁盘上的内容，未保存的编辑器改动必须先落盘。
+      await this.saveTargetDocuments(targets);
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: singleFile
+            ? `正在解决 ${path.basename(targets[0])} 的冲突…`
+            : `正在解决 ${targets.length} 个文件的冲突…`
+        },
+        () => Promise.all(this.partitionTargets(targets).map(partition => resolveSvnTargets(partition)))
+            .then(() => undefined)
+      );
+      await this.refreshAll(true);
+    } catch (error) {
+      void vscode.window.showErrorMessage(`SVN 解决冲突失败：${errorMessage(error)}`);
+    }
+  }
+
+  private async openConflictEditor(uri: vscode.Uri | undefined): Promise<void> {
+    const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+    if (!target || target.scheme !== 'file') {
+      void vscode.window.showWarningMessage('请选择一个处于冲突状态的 SVN 文件。');
+      return;
+    }
+    const status = this.statusFor(target);
+    if (!status || !isConflicted(status)) {
+      void vscode.window.showInformationMessage('该文件当前没有 SVN 冲突。');
+      return;
+    }
+
+    // 使用 TortoiseMerge 的三方冲突编辑窗口，不可用时回落到 VS Code 编辑器自带的冲突处理。
+    if (process.platform === 'win32') {
+      try {
+        const child = launchTortoise('conflicteditor', [target.fsPath]);
+        child.once('error', () => {
+          void vscode.window.showWarningMessage('无法启动 TortoiseSVN 冲突编辑窗口，已改为在 VS Code 中打开文件。');
+          void this.showWorkingFile(target);
+        });
+        return;
+      } catch (error) {
+        void vscode.window.showWarningMessage(
+          `无法启动 TortoiseSVN 冲突编辑窗口：${errorMessage(error)}，已改为在 VS Code 中打开文件。`);
+      }
+    }
+    await this.showWorkingFile(target);
+  }
+
+  private async showWorkingFile(uri: vscode.Uri): Promise<void> {
+    try {
+      await vscode.window.showTextDocument(uri, { preview: false });
+    } catch (error) {
+      void vscode.window.showErrorMessage(`无法打开文件：${errorMessage(error)}`);
+    }
+  }
+
+  private async saveTargetDocuments(targets: readonly string[]): Promise<void> {
+    const keys = new Set(targets.map(target => pathKey(target)));
+    const dirty = vscode.workspace.textDocuments.filter(
+      document => document.isDirty && !document.isUntitled && document.uri.scheme === 'file' &&
+          keys.has(pathKey(document.uri.fsPath)));
+    for (const document of dirty) {
+      await document.save();
     }
   }
 
