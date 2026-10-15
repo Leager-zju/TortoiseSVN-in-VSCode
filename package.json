@@ -2,7 +2,7 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "publisher": "leager",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -123,6 +123,12 @@
         "icon": "$(trash)"
       },
       {
+        "command": "svn.applyPatchText",
+        "title": "应用Patch文本",
+        "category": "SVN",
+        "icon": "$(play)"
+      },
+      {
         "command": "svn.openFile",
         "title": "打开文件",
         "category": "SVN",
@@ -193,6 +199,18 @@
         "title": "创建 Code Review",
         "category": "SVN",
         "icon": "$(request-changes)"
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "svn.applyPatchText",
+        "displayName": "应用Patch文本",
+        "selector": [
+          {
+            "filenamePattern": "应用Patch文本"
+          }
+        ],
+        "priority": "option"
       }
     ],
     "submenus": [
@@ -415,14 +433,18 @@
           "group": "1_svn@6"
         },
         {
+          "command": "svn.applyPatchText",
+          "group": "1_svn@7"
+        },
+        {
           "command": "svn.createCodeReview",
           "when": "isWindows && (resourcePath in svn.changedResourcePaths || scmResourceState == svn.changed || scmResourceState == svn.conflicted)",
-          "group": "1_svn@7"
+          "group": "1_svn@8"
         },
         {
           "command": "svn.resolve",
           "when": "resourcePath in svn.conflictedResourcePaths || scmResourceState == svn.conflicted",
-          "group": "1_svn@8"
+          "group": "1_svn@9"
         },
         {
           "command": "svn.add",

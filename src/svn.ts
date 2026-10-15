@@ -381,8 +381,8 @@ export async function createSvnPatch(
   await fs.writeFile(patchPath, content, 'utf8');
 }
 
-export async function applySvnPatch(patchPath: string, cwd: string): Promise<void> {
-  await runSvn(['patch', patchPath], cwd);
+export async function applySvnPatch(patchPath: string, cwd: string, strip = 0): Promise<string> {
+  return runSvn(strip > 0 ? ['patch', '--strip', String(strip), patchPath] : ['patch', patchPath], cwd);
 }
 
 export function launchTortoise(

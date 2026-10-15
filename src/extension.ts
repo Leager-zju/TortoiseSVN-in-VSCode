@@ -1,9 +1,18 @@
+import { randomBytes } from 'node:crypto';
 import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { blameLineNumber, SvnBlameAnnotator } from './blame';
 import { SvnConflictView } from './conflictView';
 import { SvnLogViewer } from './logView';
+import {
+  matchPatchRoot,
+  PATCH_TEXT_EDITOR_VIEW_TYPE,
+  patchFileEntries,
+  PatchTextEditorProvider,
+  showPatchTextInput
+} from './patchText';
 import {
   createVirtualDocumentUri,
   isConflicted,
@@ -92,6 +101,11 @@ class RepositoryManager implements vscode.Disposable {
 
   async initialize(): Promise<void> {
     this.registerCommands();
+    this.context.subscriptions.push(vscode.window.registerCustomEditorProvider(
+      PATCH_TEXT_EDITOR_VIEW_TYPE,
+      new PatchTextEditorProvider(text => this.applyPatchTextContent(text)),
+      { webviewOptions: { retainContextWhenHidden: true } }
+    ));
     await this.sourceControl.refreshPatches();
     this.registerEvents();
     this.restartAutoRefresh();
@@ -349,6 +363,7 @@ class RepositoryManager implements vscode.Disposable {
     register('svn.openPatch', first => this.openPatch(toUri(first)));
     register('svn.applyPatch', first => this.applyPatch(toUri(first)));
     register('svn.removePatch', first => this.removePatch(toUri(first)));
+    register('svn.applyPatchText', () => this.applyPatchText());
     register('svn.add', (...values) => this.runNative(
       'add',
       commandUris(...values),
@@ -849,6 +864,87 @@ class RepositoryManager implements vscode.Disposable {
     }
   }
 
+  private async applyPatchText(): Promise<void> {
+    try {
+      await showPatchTextInput(this.context.globalStorageUri);
+    } catch (error) {
+      void vscode.window.showErrorMessage(`无法打开应用Patch文本窗口：${errorMessage(error)}`);
+    }
+  }
+
+  private async applyPatchTextContent(text: string): Promise<boolean> {
+    if (!text.trim()) {
+      void vscode.window.showWarningMessage('请先输入 Patch 内容。');
+      return false;
+    }
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (folders.length === 0) {
+      void vscode.window.showErrorMessage('请先在 VS Code 中打开工作区目录。');
+      return false;
+    }
+    const entries = patchFileEntries(text);
+    if (entries.length === 0) {
+      void vscode.window.showErrorMessage('Patch 中没有找到文件路径（Index: / --- / +++）。');
+      return false;
+    }
+    const root = folders[0].uri.fsPath;
+    const match = await matchPatchRoot(root, entries, fileExists, directoryExists);
+    if (!match) {
+      void vscode.window.showErrorMessage(
+        `Patch 路径与当前工作区不匹配。\n工作区：${root}\nPatch 路径：${entries[0].path}`,
+        { modal: true }
+      );
+      return false;
+    }
+
+    const patchTargets = new Set(match.targets.map(pathKey));
+    const dirty = vscode.workspace.textDocuments.filter(document =>
+      document.isDirty && !document.isUntitled && document.uri.scheme === 'file' &&
+      patchTargets.has(pathKey(document.uri.fsPath)));
+    if (dirty.length > 0) {
+      const names = dirty.map(document => path.basename(document.uri.fsPath)).join('、');
+      const choice = await vscode.window.showWarningMessage(
+        `Patch 涉及的以下文件有未保存的改动：${names}。svn patch 只修改磁盘上的内容。`,
+        { modal: true },
+        '保存后应用',
+        '直接应用'
+      );
+      if (!choice) {
+        return false;
+      }
+      if (choice === '保存后应用') {
+        await this.saveTargetDocuments(dirty.map(document => document.uri.fsPath));
+      }
+    }
+
+    const workspaceRoot = root;
+    const strip = match.strip;
+    const patchPath = path.join(os.tmpdir(), `svn-compass-${randomBytes(8).toString('hex')}.patch`);
+    try {
+      await fs.writeFile(patchPath, text.endsWith('\n') ? text : `${text}\n`, 'utf8');
+      const output = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: '正在应用 Patch 文本…' },
+        () => applySvnPatch(patchPath, workspaceRoot, strip)
+      );
+      this.log(`应用 Patch 文本：root=${workspaceRoot} strip=${strip}\n${output.trimEnd()}`);
+      await this.refreshAll(true);
+      if (/Summary of conflicts|^\s*Skipped/m.test(output)) {
+        this.output.show(true);
+        void vscode.window.showWarningMessage('Patch 文本部分未能应用，详情见 SVN 输出面板。');
+      } else if (!output.trim()) {
+        void vscode.window.showWarningMessage('Patch 文本没有修改任何文件。');
+      } else {
+        void vscode.window.showInformationMessage('Patch 文本已应用。');
+      }
+      return true;
+    } catch (error) {
+      void vscode.window.showErrorMessage(`应用 Patch 文本失败：${errorMessage(error)}`);
+      return false;
+    } finally {
+      await fs.rm(patchPath, { force: true }).catch(() => undefined);
+    }
+  }
+
   private async removePatch(uri: vscode.Uri | undefined): Promise<void> {
     if (!uri || !this.sourceControl.isPatchUri(uri)) {
       void vscode.window.showWarningMessage('无法确定要移除的 Patch 文件。');
@@ -1272,6 +1368,14 @@ function normalizePatchFileName(value: string): string | undefined {
     return undefined;
   }
   return /\.(patch|diff)$/i.test(trimmed) ? trimmed : `${trimmed}.patch`;
+}
+
+async function directoryExists(filePath: string): Promise<boolean> {
+  try {
+    return (await fs.stat(filePath)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
