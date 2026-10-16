@@ -92,7 +92,6 @@ class RepositoryManager implements vscode.Disposable {
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.sourceControl = new SvnSourceControl(
-      context.workspaceState,
       context.globalState,
       vscode.Uri.joinPath(context.globalStorageUri, 'patches')
     );
@@ -106,7 +105,11 @@ class RepositoryManager implements vscode.Disposable {
       new PatchTextEditorProvider(text => this.applyPatchTextContent(text)),
       { webviewOptions: { retainContextWhenHidden: true } }
     ));
-    await this.sourceControl.refreshPatches();
+    try {
+      await this.sourceControl.refreshPatches();
+    } catch (error) {
+      this.log(`Patch 列表加载失败：${errorMessage(error)}`);
+    }
     this.registerEvents();
     this.restartAutoRefresh();
     await this.discoverRepositories();
@@ -131,8 +134,13 @@ class RepositoryManager implements vscode.Disposable {
 
   async refreshAll(showErrors = false): Promise<void> {
     const repositories = [...this.repositories.values()];
-    const results = await Promise.allSettled(repositories.map(repository => repository.refresh()));
-    this.sourceControl.update();
+    const results = await Promise.allSettled(repositories.map(async repository => {
+      try {
+        await repository.refresh();
+      } finally {
+        this.sourceControl.update();
+      }
+    }));
     results.forEach((result, index) => {
       if (result.status === 'rejected') {
         const repository = repositories[index];
@@ -145,7 +153,9 @@ class RepositoryManager implements vscode.Disposable {
     });
     await Promise.all([
       this.updateResourceContexts(),
-      this.sourceControl.refreshPatches()
+      this.sourceControl.refreshPatches().catch(error => {
+        this.log(`Patch 列表刷新失败：${errorMessage(error)}`);
+      })
     ]);
     this.conflictView.setEntries(this.sourceControl.statusEntries);
   }
@@ -196,21 +206,26 @@ class RepositoryManager implements vscode.Disposable {
     let discoveryComplete = true;
 
     await Promise.all(folders.map(async folder => {
+      try {
+        const root = await findWorkingCopyRoot(folder.uri.fsPath);
+        if (root) {
+          addScope(scopesByRoot, root, folder.uri.fsPath);
+        }
+      } catch (error) {
+        if (!isNotWorkingCopyError(error)) {
+          discoveryComplete = false;
+          this.log(`ERROR 查询工作区所属工作副本失败：folder=${folder.uri.fsPath} error=${errorMessage(error)}`);
+        }
+      }
+    }));
+    await this.loadDiscoveredRepositories(scopesByRoot);
+
+    await Promise.all(folders.map(async folder => {
       const folderPath = folder.uri.fsPath;
-      const [rootResult, vscodeSearchResult, nativeSearchResult] = await Promise.allSettled([
-        findWorkingCopyRoot(folderPath),
+      const [vscodeSearchResult, nativeSearchResult] = await Promise.allSettled([
         vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/.svn/wc.db'), null),
         findWorkingCopyAdminFiles(folderPath, message => this.log(message))
       ]);
-
-      if (rootResult.status === 'fulfilled') {
-        if (rootResult.value) {
-          addScope(scopesByRoot, rootResult.value, folderPath);
-        }
-      } else if (!isNotWorkingCopyError(rootResult.reason)) {
-        discoveryComplete = false;
-        this.log(`ERROR 查询工作区所属工作副本失败：folder=${folderPath} error=${errorMessage(rootResult.reason)}`);
-      }
 
       const adminFiles = new Map<string, string>();
       if (vscodeSearchResult.status === 'fulfilled') {
@@ -246,6 +261,12 @@ class RepositoryManager implements vscode.Disposable {
       }
     }
 
+    await this.loadDiscoveredRepositories(scopesByRoot);
+  }
+
+  private async loadDiscoveredRepositories(
+    scopesByRoot: Map<string, { root: string; scopes: Set<string> }>
+  ): Promise<void> {
     for (const [key, discovered] of scopesByRoot) {
       const targets = compactScopes(discovered.root, [...discovered.scopes]);
       const existing = this.repositories.get(key);
@@ -993,21 +1014,19 @@ class RepositoryManager implements vscode.Disposable {
       void vscode.window.showWarningMessage('请选择要分组的 SVN 差异文件。');
       return;
     }
-    const label = await vscode.window.showQuickPick(this.sourceControl.groupLabels, {
-      title: '移动到分组',
-      placeHolder: '选择目标分组',
-      ignoreFocusOut: true
-    });
-    if (!label) {
-      return;
-    }
-    const group = this.sourceControl.findGroupByLabel(label);
-    if (!group) {
-      void vscode.window.showErrorMessage(`分组“${label}”已不存在。`);
+    const selected = await vscode.window.showQuickPick(
+      this.sourceControl.groups.map(group => ({ label: group.label, group })),
+      {
+        title: '移动到分组',
+        placeHolder: '选择目标分组',
+        ignoreFocusOut: true
+      }
+    );
+    if (!selected) {
       return;
     }
     try {
-      await this.sourceControl.moveResources(uris, group);
+      await this.sourceControl.moveResources(uris, selected.group);
     } catch (error) {
       void vscode.window.showErrorMessage(errorMessage(error));
     }
@@ -1042,9 +1061,8 @@ class RepositoryManager implements vscode.Disposable {
       return;
     }
     const label = this.sourceControl.groupLabel(group);
-    const count = group.resourceStates.length;
     const choice = await vscode.window.showWarningMessage(
-      `是否删除分组“${label}”？组内 ${count} 个差异文件将移入默认分组。`,
+      `是否移除 changelist“${label}”？当前工作区范围内的全部成员（包括未修改文件）将解除关联，文件内容不会改变。`,
       { modal: true },
       '删除分组'
     );

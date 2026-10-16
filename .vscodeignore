@@ -1,6 +1,8 @@
 .gitignore
 .vscode/**
 src/**
+test/**
+.svn-compass-test-*/**
 tsconfig.json
 esbuild.mjs
 node_modules/**

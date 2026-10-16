@@ -2,7 +2,7 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.2.8",
+  "version": "0.3.0",
   "publisher": "leager",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -522,6 +522,7 @@
     "compile": "npm run typecheck && node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
+    "test": "node --test test/changelist.test.cjs",
     "package": "npm run compile && vsce package"
   },
   "dependencies": {

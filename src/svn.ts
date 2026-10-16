@@ -9,6 +9,7 @@ export interface SvnStatusEntry {
   item: string;
   props: string;
   revision?: string;
+  changelist?: string;
 }
 
 export interface SvnLogChangedPath {
@@ -74,7 +75,9 @@ export function runSvn(args: string[], cwd?: string, maxBuffer = 20 * 1024 * 102
         {cwd, encoding: 'utf8', maxBuffer, windowsHide: true},
         (error, stdout, stderr) => {
           if (error) {
-            const detail = String(stderr || stdout || error.message).trim();
+            const detail = error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
+              ? error.message
+              : String(stderr || stdout || error.message).trim();
             reject(new Error(
                 detail ||
                 `svn 命令执行失败（退出码 ${error.code ?? '未知'}）`));
@@ -96,6 +99,14 @@ export async function findWorkingCopyRoot(targetPath: string):
 
 export async function getSvnStatus(
     rootPath: string, targets: string[]): Promise<SvnStatusEntry[]> {
+  const batches = targetBatches(targets);
+  if (batches.length > 1) {
+    const entries: SvnStatusEntry[] = [];
+    for (const batch of batches) {
+      entries.push(...await getSvnStatus(rootPath, batch));
+    }
+    return entries;
+  }
   const output = await runSvn(
       ['status', '--xml', '--ignore-externals', '--', ...targets.map(withPegEscape)], rootPath);
   const parser = new XMLParser({
@@ -103,21 +114,25 @@ export async function getSvnStatus(
     attributeNamePrefix: '',
     parseAttributeValue: false
   });
+  type XmlStatusEntry = {
+    path?: string;
+    'wc-status'?: {item?: string; props?: string; revision?: string};
+  };
+  type XmlChangelist = {name?: string; entry?: XmlStatusEntry | XmlStatusEntry[]};
   const document = parser.parse(output) as {
     status?: {
       target?: Array<{
         path?: string;
-        entry?: Array<{
-          path?: string;
-          'wc-status'?: {item?: string; props?: string; revision?: string};
-        }>;
+        entry?: XmlStatusEntry | XmlStatusEntry[];
+        changelist?: XmlChangelist | XmlChangelist[];
       }>;
+      changelist?: XmlChangelist | XmlChangelist[];
     };
   };
 
   const entries: SvnStatusEntry[] = [];
-  for (const target of asArray(document.status?.target)) {
-    for (const entry of asArray(target.entry)) {
+  const collect = (items: XmlStatusEntry | XmlStatusEntry[] | undefined, changelist?: string): void => {
+    for (const entry of asArray(items)) {
       const status = entry['wc-status'];
       if (!entry.path || !status) {
         continue;
@@ -126,18 +141,86 @@ export async function getSvnStatus(
       const props = status.props ?? 'none';
       const filePath = path.isAbsolute(entry.path) ? path.normalize(entry.path) :
                                                      path.resolve(rootPath, entry.path);
-      if (isSvnAdminPath(filePath) || !shouldExposeStatus(item, props)) {
+      if (isSvnAdminPath(filePath) || !changelist && !shouldExposeStatus(item, props)) {
         continue;
       }
       entries.push({
         path: filePath,
         item,
         props,
-        revision: status.revision
+        revision: status.revision,
+        changelist
       });
     }
+  };
+  // 属于 changelist 的条目不在 <target> 下，而是按 <changelist name="…"> 分块单独输出。
+  const collectChangelists = (lists: XmlChangelist | XmlChangelist[] | undefined): void => {
+    for (const list of asArray(lists)) {
+      const name = list.name === undefined ? '' : String(list.name);
+      collect(list.entry, name || undefined);
+    }
+  };
+  for (const target of asArray(document.status?.target)) {
+    collect(target.entry);
+    collectChangelists(target.changelist);
   }
+  collectChangelists(document.status?.changelist);
   return entries;
+}
+
+export async function getSvnNodeKind(cwd: string, targetPath: string): Promise<'file' | 'dir'> {
+  const output = await runSvn(['info', '--show-item', 'kind', '--', withPegEscape(targetPath)], cwd);
+  const kind = output.trim();
+  if (kind !== 'file' && kind !== 'dir') {
+    throw new Error(`无法确定 SVN 资源类型：${targetPath}`);
+  }
+  return kind;
+}
+
+export async function setSvnChangelist(
+    cwd: string, changelist: string | undefined, targets: readonly string[]): Promise<void> {
+  for (const batch of targetBatches(targets)) {
+    const args = changelist === undefined
+      ? ['changelist', '--remove', '--', ...batch.map(withPegEscape)]
+      : ['changelist', '--', changelist, ...batch.map(withPegEscape)];
+    await runSvn(args, cwd);
+  }
+}
+
+/**
+ * 把 scopes 下所有属于 from 的文件改挂到 to；to 为 undefined 时解除它们的 changelist。
+ */
+export async function reassignSvnChangelist(
+    cwd: string, from: string, to: string | undefined, scopes: readonly string[]): Promise<void> {
+  for (const batch of targetBatches(scopes)) {
+    const filter = ['changelist', '--changelist', from, '--depth', 'infinity'];
+    const args = to === undefined
+      ? [...filter, '--remove', '--', ...batch.map(withPegEscape)]
+      : [...filter, '--', to, ...batch.map(withPegEscape)];
+    await runSvn(args, cwd);
+  }
+}
+
+const MAX_TARGET_ARGUMENT_LENGTH = 24000;
+
+function targetBatches(targets: readonly string[]): string[][] {
+  const batches: string[][] = [];
+  let current: string[] = [];
+  let length = 0;
+  for (const target of targets) {
+    const size = target.length + 4;
+    if (current.length > 0 && length + size > MAX_TARGET_ARGUMENT_LENGTH) {
+      batches.push(current);
+      current = [];
+      length = 0;
+    }
+    current.push(target);
+    length += size;
+  }
+  if (current.length > 0) {
+    batches.push(current);
+  }
+  return batches;
 }
 
 function isSvnAdminPath(filePath: string): boolean {
