@@ -1,6 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { WorkspaceExcludes } from './excludes';
 import { getSvnNodeKind, getSvnStatus, reassignSvnChangelist, setSvnChangelist, SvnStatusEntry } from './svn';
 
 export function createVirtualDocumentUri(scheme: string, file: vscode.Uri): vscode.Uri {
@@ -21,6 +22,7 @@ const PATCH_VIEW_ID = 'svn.patchView';
 
 export class SvnRepository {
   private statuses = new Map<string, SvnStatusEntry>();
+  private hiddenPaths = new Set<string>();
   private running: Promise<void> | undefined;
   private loaded = false;
   private initialized = false;
@@ -33,7 +35,19 @@ export class SvnRepository {
   ) {}
 
   get statusEntries(): readonly SvnStatusEntry[] {
-    return [...this.statuses.values()];
+    return [...this.statuses.values()].filter(entry => !this.hiddenPaths.has(pathKey(entry.path)));
+  }
+
+  refreshExcludes(): Promise<void> {
+    return this.enqueueUpdate(async () => {
+      this.revision++;
+      await this.updateVisibility(this.statuses, new WorkspaceExcludes(this.targets));
+    });
+  }
+
+  private async updateVisibility(statuses: Map<string, SvnStatusEntry>, excludes: WorkspaceExcludes): Promise<void> {
+    const hidden = await excludes.excludedPaths([...statuses.values()].map(entry => entry.path));
+    this.hiddenPaths = new Set([...hidden].map(pathKey));
   }
 
   /** 最近一次状态查询是否成功。 */
@@ -55,14 +69,14 @@ export class SvnRepository {
 
   changeChangelist(targets: readonly string[], changelist: string | undefined): Promise<void> {
     return this.mutateChangelist(
-      () => setSvnChangelist(this.rootUri.fsPath, changelist, targets), targets
+      visible => setSvnChangelist(this.rootUri.fsPath, changelist, visible), targets
     );
   }
 
   reassignChangelist(from: string, to: string | undefined): Promise<void> {
     const targets = this.statusEntries.filter(entry => entry.changelist === from).map(entry => entry.path);
     return this.mutateChangelist(
-      () => reassignSvnChangelist(this.rootUri.fsPath, from, to, this.targets), targets, false
+      visible => reassignSvnChangelist(this.rootUri.fsPath, from, to, visible), targets, false
     );
   }
 
@@ -73,13 +87,16 @@ export class SvnRepository {
   }
 
   private mutateChangelist(
-    action: () => Promise<void>, targets: readonly string[], explicitAssignment = true
+    action: (visible: readonly string[]) => Promise<void>, targets: readonly string[], explicitAssignment = true
   ): Promise<void> {
     return this.enqueueUpdate(async () => {
       this.revision++;
       try {
+        const excludes = new WorkspaceExcludes(this.targets);
+        const hidden = await excludes.excludedPaths(targets);
+        const visible = targets.filter(target => !hidden.has(target));
         try {
-          await action();
+          await action(visible);
         } catch (error) {
           await this.loadTargets(targets, explicitAssignment).catch(() => {
             this.loaded = false;
@@ -98,13 +115,14 @@ export class SvnRepository {
     });
   }
 
-  private async resetNewChanges(entries: SvnStatusEntry[]): Promise<void> {
+  private async resetNewChanges(entries: SvnStatusEntry[], excludes: WorkspaceExcludes): Promise<void> {
     if (!this.initialized) {
       return;
     }
+    const hidden = await excludes.excludedPaths(entries.map(entry => entry.path));
     const newChanges = entries.filter(entry => {
       const previous = this.statuses.get(pathKey(entry.path));
-      return entry.changelist && isVersionedChange(entry) &&
+      return !hidden.has(entry.path) && entry.changelist && isVersionedChange(entry) &&
         (!previous || !isVersionedChange(previous));
     });
     if (newChanges.length > 0) {
@@ -121,15 +139,19 @@ export class SvnRepository {
       return;
     }
     const entries = await getSvnStatus(this.rootUri.fsPath, [...targets]);
+    const excludes = new WorkspaceExcludes(this.targets);
     if (!explicitAssignment) {
-      await this.resetNewChanges(entries);
+      await this.resetNewChanges(entries, excludes);
     }
+    const statuses = new Map(this.statuses);
     for (const target of targets) {
-      this.statuses.delete(pathKey(target));
+      statuses.delete(pathKey(target));
     }
     for (const entry of entries) {
-      this.statuses.set(pathKey(entry.path), entry);
+      statuses.set(pathKey(entry.path), entry);
     }
+    await this.updateVisibility(statuses, excludes);
+    this.statuses = statuses;
   }
 
   private async load(): Promise<void> {
@@ -142,8 +164,11 @@ export class SvnRepository {
           return;
         }
         current = true;
-        await this.resetNewChanges(entries);
-        this.statuses = new Map(entries.map(entry => [pathKey(entry.path), entry]));
+        const excludes = new WorkspaceExcludes(this.targets);
+        await this.resetNewChanges(entries, excludes);
+        const statuses = new Map(entries.map(entry => [pathKey(entry.path), entry]));
+        await this.updateVisibility(statuses, excludes);
+        this.statuses = statuses;
         this.initialized = true;
         this.loaded = true;
       });

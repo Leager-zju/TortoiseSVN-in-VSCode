@@ -13,6 +13,7 @@ export class SvnConflictView implements vscode.Disposable, vscode.TreeDataProvid
 
   constructor() {
     this.view = this.createView();
+    this.updateMessage();
   }
 
   private createView(): vscode.TreeView<ConflictTreeItem> | undefined {
@@ -48,7 +49,15 @@ export class SvnConflictView implements vscode.Disposable, vscode.TreeDataProvid
         ? { value: this.items.length, tooltip: `${this.items.length} 个冲突文件` }
         : undefined;
     }
+    this.updateMessage();
     this.emitter.fire(undefined);
+  }
+
+  /** 用 TreeView.message 显示空状态，避免 viewsWelcome 在扩展热更新后被重复注册。 */
+  private updateMessage(): void {
+    if (this.view) {
+      this.view.message = this.items.length === 0 ? '当前工作副本没有 SVN 冲突文件。' : undefined;
+    }
   }
 
   dispose(): void {

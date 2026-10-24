@@ -13,6 +13,10 @@ let fixtureNumber = 0;
 let failCommand;
 let pauseCommand;
 let interceptCommand;
+let interceptReadDirectory;
+let interceptStat;
+let configurationProvider;
+const contexts = new Map();
 
 class Uri {
   constructor(filePath) {
@@ -37,13 +41,20 @@ const vscode = {
   ThemeColor: class {},
   RelativePattern: class {},
   languages: { registerHoverProvider: () => ({ dispose() {} }) },
-  commands: { executeCommand: async () => undefined },
+  commands: {
+    executeCommand: async (command, key, value) => {
+      if (command === 'setContext') { contexts.set(key, value); }
+    }
+  },
   workspace: {
     workspaceFolders: [],
     findFiles: async () => [],
     onDidChangeTextDocument: () => ({ dispose() {} }),
     onDidCloseTextDocument: () => ({ dispose() {} }),
-    getConfiguration: () => ({ get: (_, fallback) => fallback === 'svn.exe' ? 'svn' : fallback })
+    getConfiguration: (section, uri) => ({
+      get: (key, fallback) => configurationProvider?.(section, key, uri)
+        ?? (fallback === 'svn.exe' ? 'svn' : fallback)
+    })
   },
   scm: {
     createSourceControl: () => ({
@@ -65,7 +76,7 @@ const compiled = esbuild.buildSync({
   stdin: {
     contents: fs.readFileSync(path.join(project, 'src/extension.ts'), 'utf8')
       .replace('class RepositoryManager ', 'export class RepositoryManager ')
-      + "\nexport * from './scm'; export * from './svn';",
+      + "\nexport * from './scm'; export * from './svn'; export * from './excludes'; export { findWorkingCopyAdminFiles };",
     resolveDir: path.join(project, 'src'),
     loader: 'ts'
   },
@@ -78,6 +89,17 @@ const compiled = esbuild.buildSync({
 const loaded = { exports: {} };
 new Function('require', 'module', 'exports', compiled)(name => {
   if (name === 'vscode') { return vscode; }
+  if (name === 'node:fs/promises') {
+    return {
+      ...fs.promises,
+      readdir(directory, options) {
+        return interceptReadDirectory?.(directory, options) ?? fs.promises.readdir(directory, options);
+      },
+      stat(file) {
+        return interceptStat?.(file) ?? fs.promises.stat(file);
+      }
+    };
+  }
   if (name === 'node:child_process') {
     return {
       ...childProcess,
@@ -103,7 +125,8 @@ new Function('require', 'module', 'exports', compiled)(name => {
   }
   return require(name);
 }, loaded, loaded.exports);
-const { RepositoryManager, SvnSourceControl, SvnRepository, getSvnStatus, setSvnChangelist, isVersionedChange } = loaded.exports;
+const { RepositoryManager, SvnSourceControl, SvnRepository, getSvnStatus, setSvnChangelist,
+  isVersionedChange, WorkspaceExcludes, findWorkingCopyAdminFiles } = loaded.exports;
 
 function svn(cwd, ...args) {
   return childProcess.execFileSync('svn', args, { cwd, encoding: 'utf8', windowsHide: true });
@@ -539,11 +562,14 @@ test('a slow secondary working copy does not block publication of a completed co
 test('root changes are published before nested working-copy discovery completes', async () => {
   const f = await fixture();
   const m = manager();
-  const previous = vscode.workspace.findFiles;
   let release;
   const gate = new Promise(resolve => { release = resolve; });
   vscode.workspace.workspaceFolders = [{ uri: Uri.file(f.root) }];
-  vscode.workspace.findFiles = () => gate;
+  interceptReadDirectory = (directory, options) => {
+    if (directory === path.normalize(f.root) && options?.withFileTypes) {
+      return gate.then(() => fs.promises.readdir(directory, options));
+    }
+  };
   let completed = false;
   const running = m.discoverRepositories().then(() => { completed = true; });
   try {
@@ -551,9 +577,9 @@ test('root changes are published before nested working-copy discovery completes'
     assert.equal(completed, false);
     assert.deepEqual(members(m.sourceControl, '默认分组'), ['a.txt']);
   } finally {
-    release([]);
+    release();
     await running;
-    vscode.workspace.findFiles = previous;
+    interceptReadDirectory = undefined;
     vscode.workspace.workspaceFolders = [];
     m.dispose();
   }
@@ -741,6 +767,344 @@ test('partial changes inside a failed command are reconciled using member paths'
     assert.ok(members(f.scm, '默认分组').includes('name@x.txt'));
   } finally {
     interceptCommand = undefined;
+  }
+});
+
+test('workspace exclusion globs, false values, ancestors and Windows casing match correctly', async () => {
+  const f = await fixture();
+  configurationProvider = (section, key) => key === 'exclude'
+    ? section === 'files' ? { 'dir': true, '**/*.tmp': true, '**/{cache,build}/**': true,
+      '**/enabled/**': true, '**/kept/**': false } : { '**/enabled/**': false, '**/other/**': true }
+    : undefined;
+  try {
+    const rules = new WorkspaceExcludes([f.root]);
+    assert.equal(await rules.isExcluded(f.uri('dir/nested.txt').fsPath), true);
+    assert.equal(await rules.isExcluded(f.uri('nested/a.tmp').fsPath), true);
+    assert.equal(await rules.isExcluded(f.uri('cache/sub/file.txt').fsPath), true);
+    assert.equal(await rules.isExcluded(f.uri('build').fsPath), true);
+    assert.equal(await rules.isExcluded(f.uri('kept/file.txt').fsPath), false);
+    assert.equal(await rules.isExcluded(f.uri('enabled/file.txt').fsPath), false);
+    assert.equal(await rules.isExcluded(f.uri('other/out.txt').fsPath), true);
+    assert.equal(await rules.isExcluded(f.root), false);
+    assert.equal(await rules.isExcluded(f.uri('.svn/wc.db').fsPath), true);
+    if (process.platform === 'win32') {
+      assert.equal(await rules.isExcluded(f.uri('DIR/nested.txt').fsPath.toUpperCase()), true);
+      assert.equal(await rules.isExcluded(f.uri('a.txt').fsPath.toUpperCase()), false);
+    }
+  } finally {
+    configurationProvider = undefined;
+  }
+});
+
+test('conditional sibling exclusion uses the basename and caches directory reads', async () => {
+  const f = await fixture();
+  fs.writeFileSync(f.uri('paired.js').fsPath, 'generated');
+  fs.writeFileSync(f.uri('paired.ts').fsPath, 'source');
+  fs.writeFileSync(f.uri('standalone.js').fsPath, 'source');
+  configurationProvider = (section, key) => section === 'files' && key === 'exclude'
+    ? { '**/*.js': { when: '$(basename).ts' } } : undefined;
+  let reads = 0;
+  interceptReadDirectory = directory => {
+    if (path.normalize(directory) === path.normalize(f.root)) { reads++; }
+  };
+  try {
+    const rules = new WorkspaceExcludes([f.root]);
+    assert.equal(await rules.isExcluded(f.uri('paired.js').fsPath), true);
+    assert.equal(await rules.isExcluded(f.uri('standalone.js').fsPath), false);
+    assert.equal(reads, 1);
+  } finally {
+    configurationProvider = undefined;
+    interceptReadDirectory = undefined;
+  }
+});
+
+test('multi-root rules are relative to the most specific explicitly opened folder', async () => {
+  const f = await fixture();
+  const g = await fixture();
+  vscode.workspace.workspaceFolders = [{ uri: Uri.file(f.root) }, { uri: Uri.file(g.root) },
+    { uri: f.uri('dir') }];
+  configurationProvider = (section, key, uri) => section === 'files' && key === 'exclude'
+    ? uri.fsPath === f.root ? { 'dir': true, 'other': true }
+      : uri.fsPath === g.root ? { 'a.txt': true } : {} : undefined;
+  try {
+    const rules = new WorkspaceExcludes();
+    assert.equal(await rules.isExcluded(f.uri('other/out.txt').fsPath), true);
+    assert.equal(await rules.isExcluded(f.uri('a.txt').fsPath), false);
+    assert.equal(await rules.isExcluded(g.uri('a.txt').fsPath), true);
+    assert.equal(await rules.isExcluded(g.uri('other/out.txt').fsPath), false);
+    assert.equal(await rules.isExcluded(f.uri('dir/nested.txt').fsPath), false);
+  } finally {
+    configurationProvider = undefined;
+    vscode.workspace.workspaceFolders = [];
+  }
+});
+
+test('excluded versioned changes, normal members and unversioned paths are not published', async () => {
+  const f = await fixture();
+  fs.appendFileSync(f.uri('dir/nested.txt').fsPath, 'hidden modification\n');
+  svn(f.root, 'propset', 'test-property', 'value', 'dir');
+  fs.writeFileSync(f.uri('dir/added.txt').fsPath, 'hidden addition\n');
+  svn(f.root, 'add', 'dir/added.txt');
+  fs.writeFileSync(f.uri('dir/untracked.txt').fsPath, 'untracked');
+  svn(f.root, 'delete', 'other/out.txt');
+  await refresh(f);
+  const group = await f.scm.createGroup('可见及隐藏', [f.uri('a.txt'), f.uri('dir/nested.txt')]);
+  await setSvnChangelist(f.root, group.label, [f.uri('clean.txt').fsPath]);
+  await refresh(f);
+  configurationProvider = (section, key) => section === 'files' && key === 'exclude'
+    ? { '**/dir/**': true, '**/other/**': true, 'clean.txt': true } : undefined;
+  try {
+    await refresh(f);
+    assert.deepEqual(members(f.scm, group.label), ['a.txt']);
+    assert.equal(f.scm.sourceControl.count, 1);
+    for (const file of ['dir', 'dir/nested.txt', 'dir/added.txt', 'dir/untracked.txt', 'other/out.txt', 'clean.txt']) {
+      assert.equal(f.scm.statusFor(f.uri(file)), undefined);
+      assert.equal(f.scm.provideFileDecoration(f.uri(file)), undefined);
+    }
+    assert.equal(nativeGroup(f.root, 'dir/nested.txt'), group.label);
+    await f.scm.renameGroup(group, '只改可见');
+    assert.equal(nativeGroup(f.root, 'dir/nested.txt'), '可见及隐藏');
+    assert.equal(nativeGroup(f.root, 'clean.txt'), '可见及隐藏');
+    await f.scm.deleteGroup(f.scm.findGroupByLabel('只改可见'));
+    assert.equal(nativeGroup(f.root, 'a.txt'), '');
+    assert.equal(nativeGroup(f.root, 'dir/nested.txt'), '可见及隐藏');
+  } finally {
+    configurationProvider = undefined;
+  }
+});
+
+test('hidden fresh changes retain native association when exclusions are removed', async () => {
+  const f = await fixture();
+  await setSvnChangelist(f.root, '隐藏组', [f.uri('clean.txt').fsPath]);
+  await refresh(f);
+  configurationProvider = (section, key) => section === 'search' && key === 'exclude'
+    ? { 'clean.txt': true } : undefined;
+  try {
+    fs.appendFileSync(f.uri('clean.txt').fsPath, 'new but hidden\n');
+    await refresh(f);
+    assert.equal(f.scm.statusFor(f.uri('clean.txt')), undefined);
+    assert.equal(nativeGroup(f.root, 'clean.txt'), '隐藏组');
+    configurationProvider = undefined;
+    await f.repository.refreshExcludes();
+    f.scm.update();
+    assert.deepEqual(members(f.scm, '隐藏组'), ['clean.txt']);
+    await refresh(f);
+    assert.equal(nativeGroup(f.root, 'clean.txt'), '隐藏组');
+  } finally {
+    configurationProvider = undefined;
+  }
+});
+
+test('local writes recheck exclusions and do not touch newly hidden targets', async () => {
+  const f = await fixture();
+  const group = await f.scm.createGroup('不应改变', [f.uri('a.txt')]);
+  configurationProvider = (section, key) => section === 'files' && key === 'exclude'
+    ? { 'a.txt': true } : undefined;
+  try {
+    await f.scm.moveResources([f.uri('a.txt')], f.scm.changes);
+    assert.equal(nativeGroup(f.root, 'a.txt'), group.label);
+    assert.equal(f.scm.statusFor(f.uri('a.txt')), undefined);
+    assert.equal(f.scm.findGroupByLabel(group.label), undefined);
+  } finally {
+    configurationProvider = undefined;
+  }
+});
+
+test('native discovery prunes excluded subtrees but still identifies visible .svn roots', async () => {
+  const f = await fixture();
+  const hiddenRoot = f.uri('other/hidden-wc').fsPath;
+  const visibleRoot = f.uri('visible-wc').fsPath;
+  svn(f.root, 'checkout', repositoryUrl, hiddenRoot, '--quiet');
+  svn(f.root, 'checkout', repositoryUrl, visibleRoot, '--quiet');
+  configurationProvider = (section, key) => key === 'exclude'
+    ? section === 'files' ? { '**/.svn': true, '**/other/**': true } : { '**/dir/**': true }
+    : undefined;
+  const reads = [];
+  interceptReadDirectory = (directory, options) => {
+    if (options?.withFileTypes) { reads.push(path.normalize(directory)); }
+  };
+  try {
+    const scan = await findWorkingCopyAdminFiles(f.root, () => undefined);
+    assert.equal(scan.errors, 0);
+    assert.ok(scan.adminFiles.includes(path.join(f.root, '.svn', 'wc.db')));
+    assert.ok(scan.adminFiles.includes(path.join(visibleRoot, '.svn', 'wc.db')));
+    assert.equal(scan.adminFiles.includes(path.join(hiddenRoot, '.svn', 'wc.db')), false);
+    assert.ok(reads.every(directory => path.relative(f.root, directory).split(path.sep)
+      .every(segment => !['other', 'dir', '.svn'].includes(segment))));
+    assert.equal(scan.scannedDirectories, reads.length);
+  } finally {
+    configurationProvider = undefined;
+    interceptReadDirectory = undefined;
+  }
+});
+
+test('discovery performs one status query per root and never uses an unfiltered second search', async () => {
+  const f = await fixture();
+  const m = manager();
+  const previous = vscode.workspace.findFiles;
+  vscode.workspace.workspaceFolders = [{ uri: Uri.file(f.root) }];
+  vscode.workspace.findFiles = () => { throw new Error('duplicate discovery search'); };
+  let queries = 0;
+  failCommand = args => {
+    if (args[0] === 'status') { queries++; }
+    return false;
+  };
+  try {
+    await m.discoverRepositories();
+    assert.equal(queries, 1);
+    assert.deepEqual(members(m.sourceControl, '默认分组'), ['a.txt']);
+  } finally {
+    failCommand = undefined;
+    vscode.workspace.findFiles = previous;
+    vscode.workspace.workspaceFolders = [];
+    m.dispose();
+  }
+});
+
+test('configuration reprojection clears SCM contexts and restores native grouping without mutations', async () => {
+  const f = await fixture();
+  const m = manager();
+  await f.scm.createGroup('可恢复组', [f.uri('a.txt')]);
+  vscode.workspace.workspaceFolders = [{ uri: Uri.file(f.root) }];
+  try {
+    await m.discoverRepositories();
+    assert.deepEqual(members(m.sourceControl, '可恢复组'), ['a.txt']);
+    configurationProvider = (section, key) => section === 'files' && key === 'exclude'
+      ? { 'a.txt': true } : undefined;
+    await m.refreshExcludes();
+    assert.equal(m.sourceControl.sourceControl.count, 0);
+    assert.equal(m.sourceControl.provideFileDecoration(f.uri('a.txt')), undefined);
+    assert.deepEqual(contexts.get('svn.changedResourcePaths'), []);
+    assert.equal(nativeGroup(f.root, 'a.txt'), '可恢复组');
+    configurationProvider = undefined;
+    await m.refreshExcludes();
+    assert.deepEqual(members(m.sourceControl, '可恢复组'), ['a.txt']);
+    assert.equal(nativeGroup(f.root, 'a.txt'), '可恢复组');
+  } finally {
+    configurationProvider = undefined;
+    vscode.workspace.workspaceFolders = [];
+    m.dispose();
+  }
+});
+
+test('working-copy root above the opened folder uses folder-relative exclusions', async () => {
+  const f = await fixture();
+  fs.appendFileSync(f.uri('dir/nested.txt').fsPath, 'change inside opened subfolder\n');
+  vscode.workspace.workspaceFolders = [{ uri: f.uri('dir') }];
+  configurationProvider = (section, key) => section === 'files' && key === 'exclude'
+    ? { 'nested.txt': true } : undefined;
+  try {
+    const repository = new SvnRepository(Uri.file(f.root), [f.uri('dir').fsPath]);
+    await repository.refresh();
+    assert.equal(repository.statusEntries.length, 0);
+    configurationProvider = undefined;
+    await repository.refreshExcludes();
+    assert.equal(repository.statusEntries.length, 1);
+    assert.equal(repository.statusEntries[0].path, f.uri('dir/nested.txt').fsPath);
+  } finally {
+    configurationProvider = undefined;
+    vscode.workspace.workspaceFolders = [];
+  }
+});
+
+test('rules changed while conditional matching waits are rechecked before writing', async () => {
+  const f = await fixture();
+  const group = await f.scm.createGroup('异步排除保护', [f.uri('a.txt')]);
+  let unconditional = false;
+  configurationProvider = (section, key) => section === 'files' && key === 'exclude'
+    ? { 'a.txt': unconditional ? true : { when: 'missing-sibling.txt' } } : undefined;
+  let release;
+  let entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  interceptReadDirectory = (directory, options) => {
+    if (path.normalize(directory) === path.normalize(f.root) && options === undefined) {
+      entered();
+      return gate.then(() => fs.promises.readdir(directory));
+    }
+  };
+  const moving = f.scm.moveResources([f.uri('a.txt')], f.scm.changes);
+  try {
+    await started;
+    unconditional = true;
+    release();
+    await moving;
+    assert.equal(nativeGroup(f.root, 'a.txt'), group.label);
+    assert.equal(f.scm.statusFor(f.uri('a.txt')), undefined);
+  } finally {
+    release();
+    await moving;
+    configurationProvider = undefined;
+    interceptReadDirectory = undefined;
+  }
+});
+
+test('configuration changes during status queries force a new load after projection', async () => {
+  const f = await fixture();
+  const m = manager();
+  vscode.workspace.workspaceFolders = [{ uri: Uri.file(f.root) }];
+  await m.discoverRepositories();
+  const repository = [...m.repositories.values()][0];
+  const snapshot = svn(f.root, 'status', '--xml', '--ignore-externals', '--', `${f.root}@`);
+  fs.appendFileSync(f.uri('name@x.txt').fsPath, 'change after snapshot\n');
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  interceptCommand = (args, _, callback) => {
+    if (args[0] === 'status') {
+      interceptCommand = undefined;
+      void gate.then(() => callback(null, snapshot, ''));
+      return true;
+    }
+    return false;
+  };
+  const loading = repository.refresh();
+  configurationProvider = (section, key) => section === 'files' && key === 'exclude'
+    ? { 'a.txt': true } : undefined;
+  const updating = m.refreshExcludes();
+  try {
+    await waitUntil(() => m.sourceControl.sourceControl.count === 0);
+    release();
+    await updating;
+    await loading;
+    assert.deepEqual(members(m.sourceControl, '默认分组'), ['name@x.txt']);
+  } finally {
+    release();
+    await Promise.all([loading, updating]);
+    interceptCommand = undefined;
+    configurationProvider = undefined;
+    vscode.workspace.workspaceFolders = [];
+    m.dispose();
+  }
+});
+
+test('an unreadable nested wc database does not remove an already discovered repository', async () => {
+  const f = await fixture();
+  const m = manager();
+  vscode.workspace.workspaceFolders = [{ uri: Uri.file(temporary) }];
+  const nestedKey = process.platform === 'win32' ? f.root.toLowerCase() : f.root;
+  m.repositories.set(nestedKey, f.repository);
+  await m.sourceControl.setRepositories([f.repository]);
+  interceptStat = file => {
+    if (path.normalize(file) === path.join(f.root, '.svn', 'wc.db')) {
+      const error = Object.assign(new Error('access denied'), { code: 'EACCES' });
+      return Promise.reject(error);
+    }
+  };
+  const excludedDirectories = Object.fromEntries(fs.readdirSync(temporary)
+    .filter(name => name !== path.basename(f.root)).map(name => [name, true]));
+  configurationProvider = (section, key) => section === 'files' && key === 'exclude'
+    ? excludedDirectories : undefined;
+  try {
+    const scan = await findWorkingCopyAdminFiles(f.root, () => undefined);
+    assert.equal(scan.errors, 1);
+    await m.discoverRepositories();
+    assert.equal(m.repositories.get(nestedKey), f.repository);
+    assert.deepEqual(members(m.sourceControl, '默认分组'), ['a.txt']);
+  } finally {
+    interceptStat = undefined;
+    configurationProvider = undefined;
+    vscode.workspace.workspaceFolders = [];
+    m.dispose();
   }
 });
 

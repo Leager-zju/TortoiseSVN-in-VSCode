@@ -2,7 +2,7 @@ import {randomBytes} from 'node:crypto';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 
-import {getRevisionDiff, getSvnLog, getSvnTargetInfo, SvnLogEntry, SvnTargetInfo} from './svn';
+import {getRevisionDiff, getSvnLog, getSvnTargetInfo, SvnLogChangedPath, SvnLogEntry, SvnTargetInfo} from './svn';
 
 const PAGE_SIZE = 100;
 
@@ -272,27 +272,9 @@ class SvnLogPanel implements vscode.Disposable {
       return;
     }
 
-    const target = repositoryUrl(this.targetInfo.repositoryRoot, changed.path);
-    const copyRevision = Number(changed.copyFromRevision);
-    const hasCopySource = Boolean(
-        changed.action === 'A' && changed.copyFromPath &&
-        Number.isInteger(copyRevision) && copyRevision > 0);
-    const beforeRevision = Math.max(1, revision - 1);
-    const beforeTarget = hasCopySource ?
-        repositoryUrl(this.targetInfo.repositoryRoot, changed.copyFromPath!) :
-        target;
-    const before = repositoryRevisionUri(
-        beforeTarget, changed.path,
-        hasCopySource ? copyRevision : beforeRevision,
-        hasCopySource ? copyRevision :
-            ['D', 'R'].includes(changed.action) ? beforeRevision : revision,
-        changed.action === 'A' && !hasCopySource || revision === 1);
-    const after = repositoryRevisionUri(
-        target, changed.path, revision, revision, changed.action === 'D');
-    const fileName = path.posix.basename(changed.path) || changed.path;
-    await vscode.commands.executeCommand(
-        'vscode.diff', before, after,
-        `${fileName}（r${revision} ${changed.action}）`);
+    const { before, after, title } =
+        changedPathDiff(this.targetInfo.repositoryRoot, revision, changed);
+    await vscode.commands.executeCommand('vscode.diff', before, after, title);
   }
 
   private postState(): void {
@@ -320,6 +302,33 @@ function revisionUri(file: vscode.Uri, revision: number): vscode.Uri {
   });
 }
 
+/**
+ * 计算某次提交中一个变更路径的 Diff 左右两侧内容 URI（按仓库 URL 读取，复制来源与删除均已处理）。
+ */
+export function changedPathDiff(
+    repositoryRoot: string, revision: number,
+    changed: SvnLogChangedPath): {before: vscode.Uri; after: vscode.Uri; title: string} {
+  const target = repositoryUrl(repositoryRoot, changed.path);
+  const copyRevision = Number(changed.copyFromRevision);
+  const hasCopySource = Boolean(
+      changed.action === 'A' && changed.copyFromPath &&
+      Number.isInteger(copyRevision) && copyRevision > 0);
+  const beforeRevision = Math.max(1, revision - 1);
+  const beforeTarget = hasCopySource ?
+      repositoryUrl(repositoryRoot, changed.copyFromPath!) :
+      target;
+  const before = repositoryRevisionUri(
+      beforeTarget, changed.path,
+      hasCopySource ? copyRevision : beforeRevision,
+      hasCopySource ? copyRevision :
+          ['D', 'R'].includes(changed.action) ? beforeRevision : revision,
+      changed.action === 'A' && !hasCopySource || revision === 1);
+  const after = repositoryRevisionUri(
+      target, changed.path, revision, revision, changed.action === 'D');
+  const fileName = path.posix.basename(changed.path) || changed.path;
+  return {before, after, title: `${fileName}（r${revision} ${changed.action}）`};
+}
+
 function repositoryRevisionUri(
     target: string, repositoryPath: string, revision: number,
     pegRevision: number, empty: boolean): vscode.Uri {
@@ -331,7 +340,7 @@ function repositoryRevisionUri(
   });
   return vscode.Uri.from({
     scheme: 'svn-revision',
-    path: `/${path.posix.basename(repositoryPath) || 'content'}`,
+    path: repositoryPath.startsWith('/') ? repositoryPath : `/${repositoryPath || 'content'}`,
     query: query.toString()
   });
 }

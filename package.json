@@ -2,7 +2,7 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.3.0",
+  "version": "0.3.7",
   "publisher": "leager",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -199,6 +199,62 @@
         "title": "创建 Code Review",
         "category": "SVN",
         "icon": "$(request-changes)"
+      },
+      {
+        "command": "svn.fileHistory.refresh",
+        "title": "刷新文件日志",
+        "category": "SVN",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "svn.fileHistory.openLog",
+        "title": "打开完整 SVN 日志",
+        "category": "SVN",
+        "icon": "$(history)"
+      },
+      {
+        "command": "svn.fileHistory.loadMore",
+        "title": "加载更多文件日志",
+        "category": "SVN"
+      },
+      {
+        "command": "svn.fileHistory.toggle",
+        "title": "展开/收起变更文件",
+        "category": "SVN"
+      },
+      {
+        "command": "svn.fileHistory.openChanges",
+        "title": "查看此提交的更改",
+        "category": "SVN",
+        "icon": "$(diff-multiple)"
+      },
+      {
+        "command": "svn.fileHistory.openFileDiff",
+        "title": "打开更改",
+        "category": "SVN",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "svn.fileHistory.compareWorking",
+        "title": "当前文件与工作副本比较",
+        "category": "SVN",
+        "icon": "$(compare-changes)"
+      },
+      {
+        "command": "svn.fileHistory.openRevision",
+        "title": "打开此修订版本的当前文件",
+        "category": "SVN",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "svn.fileHistory.copyRevision",
+        "title": "复制修订号",
+        "category": "SVN"
+      },
+      {
+        "command": "svn.fileHistory.copyMessage",
+        "title": "复制提交信息",
+        "category": "SVN"
       }
     ],
     "customEditors": [
@@ -237,6 +293,13 @@
           "name": "冲突文件列表",
           "type": "tree",
           "icon": "$(warning)",
+          "visibility": "visible"
+        },
+        {
+          "id": "svn.fileHistoryView",
+          "name": "文件日志",
+          "type": "tree",
+          "icon": "$(history)",
           "visibility": "visible"
         }
       ]
@@ -344,6 +407,38 @@
         {
           "command": "svn.createCodeReview",
           "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.loadMore",
+          "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.toggle",
+          "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.openChanges",
+          "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.openFileDiff",
+          "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.compareWorking",
+          "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.openRevision",
+          "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.copyRevision",
+          "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.copyMessage",
+          "when": "false"
         }
       ],
       "scm/resourceState/context": [
@@ -388,6 +483,53 @@
           "command": "svn.resolve",
           "when": "view == svn.conflictView && viewItem == svn.conflict",
           "group": "navigation@1"
+        },
+        {
+          "command": "svn.fileHistory.openChanges",
+          "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
+          "group": "inline@1"
+        },
+        {
+          "command": "svn.fileHistory.openChanges",
+          "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
+          "group": "1_compare@1"
+        },
+        {
+          "command": "svn.fileHistory.compareWorking",
+          "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
+          "group": "1_compare@2"
+        },
+        {
+          "command": "svn.fileHistory.openRevision",
+          "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
+          "group": "1_compare@3"
+        },
+        {
+          "command": "svn.fileHistory.copyRevision",
+          "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
+          "group": "2_copy@1"
+        },
+        {
+          "command": "svn.fileHistory.copyMessage",
+          "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
+          "group": "2_copy@2"
+        },
+        {
+          "command": "svn.fileHistory.openFileDiff",
+          "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryFile",
+          "group": "inline@1"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "svn.fileHistory.openLog",
+          "when": "view == svn.fileHistoryView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "svn.fileHistory.refresh",
+          "when": "view == svn.fileHistoryView",
+          "group": "navigation@2"
         }
       ],
       "svn.moveToGroup": [
@@ -485,12 +627,6 @@
         }
       ]
     },
-    "viewsWelcome": [
-      {
-        "view": "svn.conflictView",
-        "contents": "当前工作副本没有 SVN 冲突文件。"
-      }
-    ],
     "configuration": {
       "title": "SVN",
       "properties": {
@@ -526,7 +662,8 @@
     "package": "npm run compile && vsce package"
   },
   "dependencies": {
-    "fast-xml-parser": "^5.3.0"
+    "fast-xml-parser": "^5.3.0",
+    "picomatch": "2.3.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

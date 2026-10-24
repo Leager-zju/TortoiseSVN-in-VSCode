@@ -3,8 +3,10 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { WorkspaceExcludes } from './excludes';
 import { blameLineNumber, SvnBlameAnnotator } from './blame';
 import { SvnConflictView } from './conflictView';
+import { SvnFileHistoryView } from './fileHistoryView';
 import { SvnLogViewer } from './logView';
 import {
   matchPatchRoot,
@@ -82,6 +84,7 @@ class RepositoryManager implements vscode.Disposable {
   private readonly selectionHistoryViewer = new SvnSelectionHistoryViewer();
   private readonly blameAnnotator = new SvnBlameAnnotator();
   private readonly conflictView = new SvnConflictView();
+  private readonly fileHistoryView = new SvnFileHistoryView();
   private readonly sourceControl: SvnSourceControl;
   private refreshTimer: NodeJS.Timeout | undefined;
   private refreshDebounce: NodeJS.Timeout | undefined;
@@ -95,11 +98,12 @@ class RepositoryManager implements vscode.Disposable {
       context.globalState,
       vscode.Uri.joinPath(context.globalStorageUri, 'patches')
     );
-    context.subscriptions.push(this.output, this.blameAnnotator, this.conflictView);
+    context.subscriptions.push(this.output, this.blameAnnotator, this.conflictView, this.fileHistoryView);
   }
 
   async initialize(): Promise<void> {
     this.registerCommands();
+    this.fileHistoryView.start();
     this.context.subscriptions.push(vscode.window.registerCustomEditorProvider(
       PATCH_TEXT_EDITOR_VIEW_TYPE,
       new PatchTextEditorProvider(text => this.applyPatchTextContent(text)),
@@ -132,8 +136,9 @@ class RepositoryManager implements vscode.Disposable {
     } while (this.rediscoveryRequested);
   }
 
-  async refreshAll(showErrors = false): Promise<void> {
-    const repositories = [...this.repositories.values()];
+  async refreshAll(
+    showErrors = false, repositories: readonly SvnRepository[] = [...this.repositories.values()]
+  ): Promise<void> {
     const results = await Promise.allSettled(repositories.map(async repository => {
       try {
         await repository.refresh();
@@ -222,34 +227,16 @@ class RepositoryManager implements vscode.Disposable {
 
     await Promise.all(folders.map(async folder => {
       const folderPath = folder.uri.fsPath;
-      const [vscodeSearchResult, nativeSearchResult] = await Promise.allSettled([
-        vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/.svn/wc.db'), null),
-        findWorkingCopyAdminFiles(folderPath, message => this.log(message))
-      ]);
-
-      const adminFiles = new Map<string, string>();
-      if (vscodeSearchResult.status === 'fulfilled') {
-        for (const uri of vscodeSearchResult.value) {
-          adminFiles.set(pathKey(uri.fsPath), uri.fsPath);
-        }
-      } else {
-        discoveryComplete = false;
-        this.log(`ERROR VS Code 搜索 SVN 管理文件失败：folder=${folderPath} error=${errorMessage(vscodeSearchResult.reason)}`);
-      }
-
-      if (nativeSearchResult.status === 'fulfilled') {
-        const scan = nativeSearchResult.value;
+      try {
+        const scan = await findWorkingCopyAdminFiles(folderPath, message => this.log(message));
         discoveryComplete = discoveryComplete && scan.errors === 0;
         for (const adminFile of scan.adminFiles) {
-          adminFiles.set(pathKey(adminFile), adminFile);
+          const root = path.dirname(path.dirname(adminFile));
+          addScope(scopesByRoot, root, root);
         }
-      } else {
+      } catch (error) {
         discoveryComplete = false;
-        this.log(`ERROR 原生扫描 SVN 管理文件失败：folder=${folderPath} error=${errorMessage(nativeSearchResult.reason)}`);
-      }
-
-      for (const adminFile of adminFiles.values()) {
-        addScope(scopesByRoot, path.dirname(path.dirname(adminFile)), path.dirname(path.dirname(adminFile)));
+        this.log(`ERROR 原生扫描 SVN 管理文件失败：folder=${folderPath} error=${errorMessage(error)}`);
       }
     }));
 
@@ -261,22 +248,35 @@ class RepositoryManager implements vscode.Disposable {
       }
     }
 
-    await this.loadDiscoveredRepositories(scopesByRoot);
+    await this.loadDiscoveredRepositories(scopesByRoot, false);
   }
 
   private async loadDiscoveredRepositories(
-    scopesByRoot: Map<string, { root: string; scopes: Set<string> }>
+    scopesByRoot: Map<string, { root: string; scopes: Set<string> }>, refreshExisting = true
   ): Promise<void> {
+    const changed: SvnRepository[] = [];
     for (const [key, discovered] of scopesByRoot) {
       const targets = compactScopes(discovered.root, [...discovered.scopes]);
       const existing = this.repositories.get(key);
       if (!existing || !samePaths(existing.targets, targets)) {
-        this.repositories.set(key, new SvnRepository(vscode.Uri.file(discovered.root), targets));
+        const repository = new SvnRepository(vscode.Uri.file(discovered.root), targets);
+        this.repositories.set(key, repository);
+        changed.push(repository);
       }
     }
 
     await this.sourceControl.setRepositories([...this.repositories.values()]);
-    await this.refreshAll();
+    await this.refreshAll(false, refreshExisting ? [...this.repositories.values()] : changed);
+  }
+
+  private async refreshExcludes(): Promise<void> {
+    await Promise.all([...this.repositories.values()].map(repository => repository.refreshExcludes()));
+    this.sourceControl.update();
+    await this.updateResourceContexts();
+    this.conflictView.setEntries(this.sourceControl.statusEntries);
+    await Promise.all([...this.repositories.values()].map(repository => repository.refresh(true)));
+    this.sourceControl.update();
+    await this.discoverRepositories();
   }
 
   private async updateResourceContexts(): Promise<void> {
@@ -524,6 +524,8 @@ class RepositoryManager implements vscode.Disposable {
         if (event.affectsConfiguration('svn')) {
           this.restartAutoRefresh();
           void this.discoverRepositories();
+        } else if (event.affectsConfiguration('files.exclude') || event.affectsConfiguration('search.exclude')) {
+          void this.refreshExcludes().catch(error => this.log(`排除配置刷新失败：${errorMessage(error)}`));
         }
       })
     );
@@ -539,7 +541,11 @@ class RepositoryManager implements vscode.Disposable {
       return;
     }
     const interval = Math.max(1000, configuration.get<number>('refreshInterval', 3000));
-    this.refreshTimer = setInterval(() => void this.refreshAll(), interval);
+    this.refreshTimer = setInterval(() => {
+      if (!this.discovering) {
+        void this.refreshAll().catch(error => this.log(`自动刷新失败：${errorMessage(error)}`));
+      }
+    }, interval);
   }
 
   private async revertChange(
@@ -1062,7 +1068,7 @@ class RepositoryManager implements vscode.Disposable {
     }
     const label = this.sourceControl.groupLabel(group);
     const choice = await vscode.window.showWarningMessage(
-      `是否移除 changelist“${label}”？当前工作区范围内的全部成员（包括未修改文件）将解除关联，文件内容不会改变。`,
+      `是否移除 changelist“${label}”？当前工作区内未被排除的成员（包括未修改文件）将解除关联，文件内容不会改变。`,
       { modal: true },
       '删除分组'
     );
@@ -1131,7 +1137,12 @@ class RepositoryManager implements vscode.Disposable {
       try {
         const child = launchTortoise(command, partition);
         child.once('error', error => void vscode.window.showErrorMessage(`无法启动 TortoiseSVN：${error.message}`));
-        child.once('close', () => this.scheduleRefresh());
+        child.once('close', () => {
+          this.scheduleRefresh();
+          if (command === 'update' || command === 'commit') {
+            this.fileHistoryView.invalidate();
+          }
+        });
       } catch (error) {
         void vscode.window.showErrorMessage(errorMessage(error));
       }
@@ -1461,13 +1472,18 @@ async function findWorkingCopyAdminFiles(
   const startedAt = Date.now();
   const adminFiles: string[] = [];
   const pending = [path.normalize(rootPath)];
+  const excludes = new WorkspaceExcludes([rootPath]);
   let scannedDirectories = 0;
   let errors = 0;
   while (pending.length > 0) {
     const batch = pending.splice(0, 32);
     const discoveredChildren = await Promise.all(batch.map(async directory => {
       try {
+        if (await excludes.isExcluded(directory)) {
+          return [];
+        }
         const entries = await fs.readdir(directory, { withFileTypes: true });
+        excludes.seedDirectory(directory, entries.map(entry => entry.name));
         scannedDirectories += 1;
         const svnDirectory = entries.find(entry =>
           entry.isDirectory() && entry.name.toLocaleLowerCase() === '.svn');
@@ -1479,14 +1495,19 @@ async function findWorkingCopyAdminFiles(
               adminFiles.push(path.normalize(wcDatabase));
             }
           } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+              errors++;
+            }
             log(`ERROR 原生扫描发现 .svn 但无法读取 wc.db：path=${wcDatabase} error=${errorMessage(error)}`);
           }
         }
 
-        return entries
+        const children = entries
           .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() &&
             entry.name.toLocaleLowerCase() !== '.svn')
           .map(entry => path.join(directory, entry.name));
+        const hidden = await excludes.excludedPaths(children);
+        return children.filter(child => !hidden.has(child));
       } catch (error) {
         errors += 1;
         log(`ERROR 原生扫描目录失败：path=${directory} error=${errorMessage(error)}`);
