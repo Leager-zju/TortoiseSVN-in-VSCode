@@ -1,7 +1,9 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { changedPathDiff } from './logView';
-import { getSvnLog, getSvnTargetInfo, SvnLogChangedPath, SvnLogEntry } from './svn';
+import {
+  getSvnLog, getSvnTargetInfo, reverseMergeSvn, SvnLogChangedPath, SvnLogEntry, updateSvnToRevision
+} from './svn';
 
 const FILE_HISTORY_VIEW_ID = 'svn.fileHistoryView';
 const CHANGED_PATH_SCHEME = 'svn-history-path';
@@ -24,6 +26,7 @@ export class SvnFileHistoryView implements vscode.Disposable, vscode.TreeDataPro
   private readonly expanded = new Set<number>();
   private baseRevision: number | undefined;
   private repositoryRoot: string | undefined;
+  private targetUrl: string | undefined;
   private targetRepositoryPath: string | undefined;
   private nextRevision: number | undefined;
   private hasMore = false;
@@ -50,6 +53,9 @@ export class SvnFileHistoryView implements vscode.Disposable, vscode.TreeDataPro
     register('svn.fileHistory.openRevision', node => this.openRevision(asCommit(node)));
     register('svn.fileHistory.copyRevision', node => this.copy(asCommit(node), commit => `r${commit.entry.revision}`));
     register('svn.fileHistory.copyMessage', node => this.copy(asCommit(node), commit => commit.entry.message));
+    register('svn.fileHistory.updateToRevision', node => this.updateToRevision(asCommit(node)));
+    register('svn.fileHistory.revertToRevision', node => this.revertToRevision(asCommit(node)));
+    register('svn.fileHistory.revertChangesFromRevision', node => this.revertChangesFromRevision(asCommit(node)));
     this.disposables.push(vscode.window.registerFileDecorationProvider(new ChangedPathDecorations()));
 
     this.disposables.push(vscode.window.onDidChangeActiveTextEditor(editor => this.track(editor)));
@@ -155,6 +161,7 @@ export class SvnFileHistoryView implements vscode.Disposable, vscode.TreeDataPro
     this.expanded.clear();
     this.baseRevision = undefined;
     this.repositoryRoot = undefined;
+    this.targetUrl = undefined;
     this.targetRepositoryPath = undefined;
     this.nextRevision = undefined;
     this.hasMore = false;
@@ -190,6 +197,7 @@ export class SvnFileHistoryView implements vscode.Disposable, vscode.TreeDataPro
       const base = Number(info?.revision);
       this.baseRevision = Number.isInteger(base) && base > 0 ? base : undefined;
       this.repositoryRoot = info?.repositoryRoot;
+      this.targetUrl = info?.url;
       this.targetRepositoryPath = info ? repositoryPathOf(info.url, info.repositoryRoot) : undefined;
       this.entries = page.entries;
       this.nextRevision = page.nextRevision;
@@ -322,6 +330,79 @@ export class SvnFileHistoryView implements vscode.Disposable, vscode.TreeDataPro
     if (commit) {
       await vscode.env.clipboard.writeText(text(commit));
     }
+  }
+
+  /** svn update -r REV：把该文件更新到所选修订。 */
+  private async updateToRevision(commit: CommitNode | undefined): Promise<void> {
+    if (!commit) {
+      return;
+    }
+    const revision = commit.entry.revision;
+    const choice = await vscode.window.showWarningMessage(
+      `是否将“${path.basename(commit.file.fsPath)}”更新到 r${revision}？该文件的本地修改会保留，可能产生冲突。`,
+      { modal: true }, '更新到此版本');
+    if (choice !== '更新到此版本') {
+      return;
+    }
+    await this.runOperation(`更新到 r${revision}`, () =>
+      updateSvnToRevision(commit.file.fsPath, revision));
+  }
+
+  /** svn merge -r BASE:REV：把文件内容退回到所选修订，结果作为本地修改保留。 */
+  private async revertToRevision(commit: CommitNode | undefined): Promise<void> {
+    const url = this.requireTargetUrl();
+    if (!commit || !url) {
+      return;
+    }
+    const revision = commit.entry.revision;
+    const from = this.baseRevision ?? revision;
+    const choice = await vscode.window.showWarningMessage(
+      `是否把“${path.basename(commit.file.fsPath)}”的内容退回到 r${revision}？` +
+      `将以本地修改的形式保留，不会自动提交。`,
+      { modal: true }, '回退到此版本');
+    if (choice !== '回退到此版本') {
+      return;
+    }
+    await this.runOperation(`回退到 r${revision}`, () =>
+      reverseMergeSvn(commit.file.fsPath, url, from, { from, to: revision }));
+  }
+
+  /** svn merge -c -REV：撤销该次提交对这个文件的修改，结果作为本地修改保留。 */
+  private async revertChangesFromRevision(commit: CommitNode | undefined): Promise<void> {
+    const url = this.requireTargetUrl();
+    if (!commit || !url) {
+      return;
+    }
+    const revision = commit.entry.revision;
+    const choice = await vscode.window.showWarningMessage(
+      `是否撤销 r${revision} 对“${path.basename(commit.file.fsPath)}”的修改？` +
+      `将以本地修改的形式保留，不会自动提交。`,
+      { modal: true }, '回退该版本的修改');
+    if (choice !== '回退该版本的修改') {
+      return;
+    }
+    await this.runOperation(`撤销 r${revision} 的修改`, () =>
+      reverseMergeSvn(commit.file.fsPath, url, revision, { change: revision }));
+  }
+
+  private async runOperation(label: string, operation: () => Promise<string>): Promise<void> {
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.SourceControl, title: `SVN：${label}` },
+        operation);
+      void vscode.window.showInformationMessage(`SVN：${label} 已完成。`);
+      this.invalidate();
+      await vscode.commands.executeCommand('svn.refresh');
+    } catch (error) {
+      void vscode.window.showErrorMessage(`SVN：${label} 失败。${errorMessage(error)}`);
+    }
+  }
+
+  private requireTargetUrl(): string | undefined {
+    if (!this.targetUrl) {
+      void vscode.window.showWarningMessage('无法读取该文件的 SVN 仓库地址，请刷新文件日志后重试。');
+    }
+    return this.targetUrl;
   }
 }
 

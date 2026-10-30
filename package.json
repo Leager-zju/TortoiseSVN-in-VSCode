@@ -2,7 +2,7 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.3.7",
+  "version": "0.3.9",
   "publisher": "leager",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -255,6 +255,24 @@
         "command": "svn.fileHistory.copyMessage",
         "title": "复制提交信息",
         "category": "SVN"
+      },
+      {
+        "command": "svn.fileHistory.updateToRevision",
+        "title": "更新到此版本",
+        "category": "SVN",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "svn.fileHistory.revertToRevision",
+        "title": "回退到此版本",
+        "category": "SVN",
+        "icon": "$(history)"
+      },
+      {
+        "command": "svn.fileHistory.revertChangesFromRevision",
+        "title": "回退该版本的修改",
+        "category": "SVN",
+        "icon": "$(discard)"
       }
     ],
     "customEditors": [
@@ -439,6 +457,18 @@
         {
           "command": "svn.fileHistory.copyMessage",
           "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.updateToRevision",
+          "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.revertToRevision",
+          "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.revertChangesFromRevision",
+          "when": "false"
         }
       ],
       "scm/resourceState/context": [
@@ -513,6 +543,21 @@
           "command": "svn.fileHistory.copyMessage",
           "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
           "group": "2_copy@2"
+        },
+        {
+          "command": "svn.fileHistory.updateToRevision",
+          "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
+          "group": "3_revision@1"
+        },
+        {
+          "command": "svn.fileHistory.revertToRevision",
+          "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
+          "group": "3_revision@2"
+        },
+        {
+          "command": "svn.fileHistory.revertChangesFromRevision",
+          "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
+          "group": "3_revision@3"
         },
         {
           "command": "svn.fileHistory.openFileDiff",

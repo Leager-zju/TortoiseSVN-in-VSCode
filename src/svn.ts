@@ -420,6 +420,41 @@ export async function getRevisionDiff(filePath: string, revision: number): Promi
   return runSvn(['diff', '-c', String(revision), '--', withPegEscape(filePath)], path.dirname(filePath));
 }
 
+/** svn update -r REV：把工作副本中的单个文件更新到指定修订。 */
+export async function updateSvnToRevision(filePath: string, revision: number): Promise<string> {
+  return runSvn(
+    ['update', '-r', String(revision), '--non-interactive', '--accept', 'postpone', '--', withPegEscape(filePath)],
+    path.dirname(filePath));
+}
+
+/**
+ * svn merge 反向合并：
+ * - 指定 changeRevision 时为 `-c -REV`，撤销该次提交对文件的修改；
+ * - 否则为 `-r FROM:TO`（FROM > TO），撤销 TO 之后到 FROM 为止的全部修改，使内容回到 TO。
+ * source 为带 peg 修订的仓库 URL，结果作为本地修改留在工作副本中，需用户自行提交。
+ */
+export async function reverseMergeSvn(
+  filePath: string,
+  sourceUrl: string,
+  pegRevision: number,
+  range: { change: number } | { from: number; to: number }
+): Promise<string> {
+  const revisionArgs = 'change' in range
+    ? ['-c', `-${range.change}`]
+    : ['-r', `${range.from}:${range.to}`];
+  // merge 的目标 WCPATH 不解析 peg 修订，既不能追加 “@”，也无法直接接受含 “@” 的路径。
+  // 这种情况下以所在目录为合并目标（同名文件），语义等价。
+  const name = path.basename(filePath);
+  const target = name.includes('@') ? '.' : filePath;
+  if (target === '.' && decodeURIComponent(sourceUrl.split('/').pop() ?? '') !== name) {
+    throw new Error('文件名包含 “@” 且与仓库中的路径不一致，无法安全执行合并，请先提交或还原重命名后再试。');
+  }
+  return runSvn(
+    ['merge', ...revisionArgs, '--non-interactive', '--accept', 'postpone', '--',
+      `${sourceUrl}@${pegRevision}`, target],
+    path.dirname(filePath));
+}
+
 function withPegEscape(targetPath: string): string {
   return `${targetPath}@`;
 }
