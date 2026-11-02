@@ -103,7 +103,7 @@ class RepositoryManager implements vscode.Disposable {
 
   async initialize(): Promise<void> {
     this.registerCommands();
-    this.fileHistoryView.start();
+    this.fileHistoryView.start(this.context.globalState);
     this.context.subscriptions.push(vscode.window.registerCustomEditorProvider(
       PATCH_TEXT_EDITOR_VIEW_TYPE,
       new PatchTextEditorProvider(text => this.applyPatchTextContent(text)),

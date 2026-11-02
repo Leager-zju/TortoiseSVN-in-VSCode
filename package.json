@@ -2,7 +2,7 @@
   "name": "svn-compass",
   "displayName": "SVN Compass",
   "description": "在 VS Code 中使用 TortoiseSVN 更新、提交、回退、Diff、加入版本管理，并在资源管理器与源代码管理侧栏展示 SVN 更改。",
-  "version": "0.3.9",
+  "version": "0.3.11",
   "publisher": "leager",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -273,6 +273,12 @@
         "title": "回退该版本的修改",
         "category": "SVN",
         "icon": "$(discard)"
+      },
+      {
+        "command": "svn.fileHistory.mergeToBranch",
+        "title": "合并到目标分支…",
+        "category": "SVN",
+        "icon": "$(git-merge)"
       }
     ],
     "customEditors": [
@@ -469,6 +475,10 @@
         {
           "command": "svn.fileHistory.revertChangesFromRevision",
           "when": "false"
+        },
+        {
+          "command": "svn.fileHistory.mergeToBranch",
+          "when": "false"
         }
       ],
       "scm/resourceState/context": [
@@ -558,6 +568,11 @@
           "command": "svn.fileHistory.revertChangesFromRevision",
           "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
           "group": "3_revision@3"
+        },
+        {
+          "command": "svn.fileHistory.mergeToBranch",
+          "when": "view == svn.fileHistoryView && viewItem == svn.fileHistoryCommit",
+          "group": "4_merge@1"
         },
         {
           "command": "svn.fileHistory.openFileDiff",

@@ -1,13 +1,16 @@
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { changedPathDiff } from './logView';
+import { changedPathDiff, repositoryUrl } from './logView';
 import {
-  getSvnLog, getSvnTargetInfo, reverseMergeSvn, SvnLogChangedPath, SvnLogEntry, updateSvnToRevision
+  findWorkingCopyRoot, getSvnLog, getSvnTargetInfo, mergeSvnRevision, parseSvnMergeOutput, reverseMergeSvn,
+  SvnLogChangedPath, SvnLogEntry, SvnMergeChange, updateSvnToRevision, updateSvnWorkingCopy
 } from './svn';
 
 const FILE_HISTORY_VIEW_ID = 'svn.fileHistoryView';
 const CHANGED_PATH_SCHEME = 'svn-history-path';
 const COMMIT_MARK_SCHEME = 'svn-history-commit';
+const LAST_MERGE_DIRECTORY_KEY = 'svn.fileHistory.lastMergeDirectory';
 const PAGE_SIZE = 50;
 
 type HistoryNode = CommitNode | ChangedPathNode | LoadMoreNode;
@@ -21,6 +24,7 @@ export class SvnFileHistoryView implements vscode.Disposable, vscode.TreeDataPro
   readonly onDidChangeTreeData = this.emitter.event;
   private readonly view: vscode.TreeView<HistoryNode> | undefined;
   private readonly disposables: vscode.Disposable[] = [];
+  private state: vscode.Memento | undefined;
   private target: vscode.Uri | undefined;
   private entries: SvnLogEntry[] = [];
   private readonly expanded = new Set<number>();
@@ -39,8 +43,9 @@ export class SvnFileHistoryView implements vscode.Disposable, vscode.TreeDataPro
     this.view = this.createView();
   }
 
-  /** 注册视图命令并开始跟随活动编辑器。 */
-  start(): void {
+  /** 注册视图命令并开始跟随活动编辑器；state 用于记住“合并到目标分支”上次选择的目录。 */
+  start(state?: vscode.Memento): void {
+    this.state = state;
     const register = (command: string, callback: (...args: unknown[]) => unknown) =>
       this.disposables.push(vscode.commands.registerCommand(command, callback));
     register('svn.fileHistory.refresh', () => this.reload());
@@ -56,6 +61,7 @@ export class SvnFileHistoryView implements vscode.Disposable, vscode.TreeDataPro
     register('svn.fileHistory.updateToRevision', node => this.updateToRevision(asCommit(node)));
     register('svn.fileHistory.revertToRevision', node => this.revertToRevision(asCommit(node)));
     register('svn.fileHistory.revertChangesFromRevision', node => this.revertChangesFromRevision(asCommit(node)));
+    register('svn.fileHistory.mergeToBranch', node => this.mergeToBranch(asCommit(node)));
     this.disposables.push(vscode.window.registerFileDecorationProvider(new ChangedPathDecorations()));
 
     this.disposables.push(vscode.window.onDidChangeActiveTextEditor(editor => this.track(editor)));
@@ -385,16 +391,256 @@ export class SvnFileHistoryView implements vscode.Disposable, vscode.TreeDataPro
       reverseMergeSvn(commit.file.fsPath, url, revision, { change: revision }));
   }
 
-  private async runOperation(label: string, operation: () => Promise<string>): Promise<void> {
+  /**
+   * 把该次提交的改动合并到用户选择的目标目录对应的位置（其他分支的工作副本根目录、子目录，
+   * 或包含嵌套工作副本的上层目录），用一次 svn merge -c REV 完成，并先 --dry-run 预演供用户确认。
+   */
+  private async mergeToBranch(commit: CommitNode | undefined): Promise<void> {
+    if (!commit) {
+      return;
+    }
+    const revision = commit.entry.revision;
     try {
-      await vscode.window.withProgress(
+      const sourceRoot = await findWorkingCopyRoot(commit.file.fsPath);
+      if (!sourceRoot) {
+        throw new Error('无法确定当前文件所在的 SVN 工作副本。');
+      }
+      const picked = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        defaultUri: vscode.Uri.file(await this.defaultMergeDirectory(sourceRoot)),
+        openLabel: '合并到此目录',
+        title: `选择要合并 r${revision} 的目标目录（与源目录结构相同的其他分支目录）`
+      });
+      const selected = picked?.[0]?.fsPath;
+      if (!selected) {
+        return;
+      }
+      await this.state?.update(LAST_MERGE_DIRECTORY_KEY, selected);
+      const plan = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `SVN：正在定位 r${revision} 的合并目标…` },
+        () => this.resolveMergeTarget(commit, sourceRoot, selected));
+      if (!plan) {
+        return;
+      }
+      const changes = await this.dryRunMerge(plan, revision);
+      if (!changes) {
+        return;
+      }
+
+      const targetDirectory = plan.targetDirectory;
+      const files = changes.filter(change => change.path !== '.');
+      if (files.length === 0) {
+        void vscode.window.showInformationMessage(
+          `r${revision} 在“${plan.sourcePath}”下的改动已存在于“${targetDirectory}”，或没有可合并的内容。`);
+        return;
+      }
+      const conflicts = files.filter(change => change.conflicted);
+      const MAX_LISTED = 30;
+      const listed = files.slice(0, MAX_LISTED)
+        .map(change => `${change.conflicted ? '⚠ ' : ''}${change.status.trim()}  ${change.path}`);
+      if (files.length > MAX_LISTED) {
+        listed.push(`…以及另外 ${files.length - MAX_LISTED} 个文件`);
+      }
+      const detail = [
+        `源：${plan.sourceUrl}@${revision}`,
+        `目标：${targetDirectory}`,
+        ...(pathKey(targetDirectory) !== pathKey(selected) ? [`（由所选目录“${selected}”按目录结构定位）`] : []),
+        '',
+        ...listed,
+        '',
+        conflicts.length > 0
+          ? `预计有 ${conflicts.length} 个文件冲突，合并后需手动解决。`
+          : '预演未发现冲突。',
+        '合并结果将作为本地修改保留在目标工作副本中，不会自动提交。'
+      ].join('\n');
+      const action = conflicts.length > 0 ? '仍然合并' : '合并';
+      const choice = await vscode.window.showWarningMessage(
+        `是否把 r${revision} 的 ${files.length} 个文件改动合并到目标目录？`,
+        { modal: true, detail }, action);
+      if (choice !== action) {
+        return;
+      }
+      await this.runOperation(`合并 r${revision} 到 ${path.basename(targetDirectory)}`,
+        () => mergeSvnRevision(targetDirectory, plan.sourceUrl, revision, false),
+        output => {
+          const conflicted = parseSvnMergeOutput(output).filter(change => change.conflicted);
+          if (conflicted.length > 0) {
+            void vscode.window.showWarningMessage(
+              `SVN：r${revision} 已合并到 ${targetDirectory}，但有 ${conflicted.length} 个文件冲突，请在“冲突文件列表”中处理。`);
+          } else {
+            void vscode.window.showInformationMessage(
+              `SVN：r${revision} 已合并到 ${targetDirectory}，请检查后提交。`);
+          }
+        });
+    } catch (error) {
+      void vscode.window.showErrorMessage(`SVN：合并 r${revision} 失败。${mergeErrorMessage(error)}`);
+    }
+  }
+
+  /** 目录选择窗口的初始位置：上次选择且仍存在的目录，否则为源工作副本的上一级目录。 */
+  private async defaultMergeDirectory(sourceRoot: string): Promise<string> {
+    const last = this.state?.get<string>(LAST_MERGE_DIRECTORY_KEY);
+    if (last) {
+      try {
+        if ((await fs.stat(last)).isDirectory()) {
+          return last;
+        }
+      } catch {
+        // 上次的目录已不存在，回退到默认位置。
+      }
+    }
+    return path.dirname(sourceRoot);
+  }
+
+  /** 预演合并；目标是混合修订工作副本时，询问是否先更新目标目录再重试。 */
+  private async dryRunMerge(plan: MergePlan, revision: number): Promise<SvnMergeChange[] | undefined> {
+    const run = () => vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `SVN：正在预演合并 r${revision}…` },
+      () => mergeSvnRevision(plan.targetDirectory, plan.sourceUrl, revision, true));
+    try {
+      return parseSvnMergeOutput(await run());
+    } catch (error) {
+      if (!/E195020|mixed-revision/i.test(errorMessage(error))) {
+        throw error;
+      }
+      const choice = await vscode.window.showWarningMessage(
+        `目标目录包含多个修订版本，svn 要求先更新后才能合并。是否现在更新“${plan.targetDirectory}”？`,
+        { modal: true, detail: errorMessage(error) }, '更新并继续');
+      if (choice !== '更新并继续') {
+        return undefined;
+      }
+      const output = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `SVN：正在更新 ${plan.targetDirectory}…` },
+        () => updateSvnWorkingCopy(plan.targetDirectory));
+      const updateConflicts = parseSvnMergeOutput(output).filter(change => change.conflicted);
+      if (updateConflicts.length > 0) {
+        throw new Error(`更新目标目录时产生 ${updateConflicts.length} 个冲突，请先处理冲突后再合并。`);
+      }
+      void vscode.commands.executeCommand('svn.refresh');
+      return parseSvnMergeOutput(await run());
+    }
+  }
+
+  /**
+   * 确定合并的源路径与目标目录：
+   * 1. 按本地目录结构对应：在所选目录下按“源文件目录相对其某个上层目录”的相对路径找到对应目录，
+   *    以两者仓库路径的公共后缀推出分支映射（如 /trunk → /branches/V120）。所选目录是包含嵌套工作副本的
+   *    上层目录时，自动定位到与源工作副本对应的嵌套工作副本。
+   * 2. 退回到“所选目录在其工作副本中的相对位置”映射，同样校验分支映射。
+   */
+  private async resolveMergeTarget(
+    commit: CommitNode, sourceRoot: string, selected: string
+  ): Promise<MergePlan | undefined> {
+    const revision = commit.entry.revision;
+    const fileDirectory = path.dirname(commit.file.fsPath);
+    const [sourceInfo, fileDirectoryInfo] = await Promise.all([
+      getSvnTargetInfo(sourceRoot), getSvnTargetInfo(fileDirectory)
+    ]);
+    const sourceRootPath = repositoryPathOf(sourceInfo.url, sourceInfo.repositoryRoot);
+    const fileDirectoryPath = repositoryPathOf(fileDirectoryInfo.url, fileDirectoryInfo.repositoryRoot);
+    if (sourceRootPath === undefined || fileDirectoryPath === undefined) {
+      throw new Error('无法解析源工作副本对应的仓库路径。');
+    }
+    const sameRepository = (info: { repositoryUuid?: string }) =>
+      !sourceInfo.repositoryUuid || !info.repositoryUuid || info.repositoryUuid === sourceInfo.repositoryUuid;
+
+    let resolved: { targetDirectory: string; sourcePath: string } | undefined;
+    let sameLocation = false;
+
+    // 策略 1：按本地目录结构定位。
+    const candidates = await Promise.all(ancestorsOf(fileDirectory).map(async anchor => {
+      const counterpart = path.join(selected, path.relative(anchor, fileDirectory));
+      const info = await directoryInfo(counterpart);
+      if (!info || !sameRepository(info)) {
+        return undefined;
+      }
+      const counterpartPath = repositoryPathOf(info.url, info.repositoryRoot);
+      const mapping = counterpartPath === undefined ? undefined : branchMapping(fileDirectoryPath, counterpartPath);
+      return mapping ? { anchor, mapping } : undefined;
+    }));
+    const best = candidates
+      .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined)
+      .sort((left, right) => right.mapping.common - left.mapping.common)[0];
+    if (best?.mapping.same) {
+      sameLocation = true;
+    } else if (best) {
+      const anchorContainsSource = isInsideDirectory(best.anchor, sourceRoot);
+      const targetDirectory = anchorContainsSource
+        ? path.join(selected, path.relative(best.anchor, sourceRoot))
+        : selected;
+      const sourcePath = anchorContainsSource
+        ? sourceRootPath
+        : path.posix.join(sourceRootPath, toPosix(path.relative(sourceRoot, best.anchor)));
+      const info = await directoryInfo(targetDirectory);
+      const { sourcePrefix, targetPrefix } = best.mapping;
+      const mapped = sourcePrefix === '' || sourcePath === sourcePrefix || sourcePath.startsWith(`${sourcePrefix}/`);
+      const expected = mapped ? targetPrefix + sourcePath.slice(sourcePrefix.length) || '/' : undefined;
+      if (!info || !expected || repositoryPathOf(info.url, info.repositoryRoot) !== expected) {
+        throw new Error(`按目录结构定位到“${targetDirectory}”，但它对应的仓库路径与源“${sourcePath}”不对应，` +
+          '两个目录的工作副本结构不一致，请直接选择与源工作副本对应的目录。');
+      }
+      resolved = { targetDirectory, sourcePath };
+    }
+
+    // 策略 2：所选目录在其工作副本中的相对位置。
+    if (!resolved && !sameLocation) {
+      const selectedInfo = await directoryInfo(selected);
+      const targetRoot = selectedInfo && sameRepository(selectedInfo)
+        ? await findWorkingCopyRoot(selected).catch(() => undefined)
+        : undefined;
+      const selectedPath = selectedInfo ? repositoryPathOf(selectedInfo.url, selectedInfo.repositoryRoot) : undefined;
+      if (targetRoot && selectedPath !== undefined) {
+        const sourcePath = path.posix.join(sourceRootPath, toPosix(path.relative(targetRoot, selected)));
+        const mapping = branchMapping(sourcePath, selectedPath);
+        if (mapping?.same) {
+          sameLocation = true;
+        } else if (mapping) {
+          resolved = { targetDirectory: selected, sourcePath };
+        }
+      }
+    }
+
+    if (sameLocation) {
+      void vscode.window.showInformationMessage(`所选目录就是 r${revision} 的来源位置，无需合并。`);
+      return undefined;
+    }
+    if (!resolved) {
+      throw new Error(`无法确定“${selected}”与源工作副本“${sourceRoot}”的对应关系。` +
+        '请选择与源目录结构相同的分支目录（其下应能找到与当前文件相同相对路径的目录）。');
+    }
+
+    const { targetDirectory, sourcePath } = resolved;
+    const prefix = sourcePath === '/' ? '/' : `${sourcePath}/`;
+    if (!commit.entry.changedPaths.some(changed => changed.path === sourcePath || changed.path.startsWith(prefix))) {
+      void vscode.window.showInformationMessage(`r${revision} 在“${sourcePath}”下没有改动，无需合并到“${targetDirectory}”。`);
+      return undefined;
+    }
+    const targetInfo = await getSvnTargetInfo(targetDirectory);
+    // 用目标仓库的根地址拼接，避免同一仓库因访问地址不同（不同域名、http/https）被当成外部仓库。
+    const sourceUrl = sourcePath === '/'
+      ? targetInfo.repositoryRoot.replace(/\/+$/, '')
+      : repositoryUrl(targetInfo.repositoryRoot, sourcePath);
+    return { sourceUrl, sourcePath, targetDirectory };
+  }
+
+  private async runOperation(
+    label: string, operation: () => Promise<string>, report?: (output: string) => void
+  ): Promise<void> {
+    try {
+      const output = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.SourceControl, title: `SVN：${label}` },
         operation);
-      void vscode.window.showInformationMessage(`SVN：${label} 已完成。`);
+      if (report) {
+        report(output);
+      } else {
+        void vscode.window.showInformationMessage(`SVN：${label} 已完成。`);
+      }
       this.invalidate();
       await vscode.commands.executeCommand('svn.refresh');
     } catch (error) {
-      void vscode.window.showErrorMessage(`SVN：${label} 失败。${errorMessage(error)}`);
+      void vscode.window.showErrorMessage(`SVN：${label} 失败。${mergeErrorMessage(error)}`);
     }
   }
 
@@ -603,6 +849,9 @@ function actionLabel(action: string): string {
 /** 把仓库 URL 转成以 / 开头的仓库内路径，与 svn log 的变更路径格式一致。 */
 function repositoryPathOf(url: string, repositoryRoot: string): string | undefined {
   const root = repositoryRoot.replace(/\/+$/, '');
+  if (url.replace(/\/+$/, '') === root) {
+    return '/';
+  }
   if (!url.startsWith(`${root}/`)) {
     return undefined;
   }
@@ -676,4 +925,77 @@ function pathKey(value: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+type MergePlan = { sourceUrl: string; sourcePath: string; targetDirectory: string };
+
+type BranchMapping = { same: boolean; common: number; sourcePrefix: string; targetPrefix: string };
+
+/**
+ * 比较两个仓库路径的公共后缀，推出分支映射：
+ * /trunk/Sources/Content/X 与 /branches/V120/Sources/Content/X → /trunk ↔ /branches/V120。
+ * 两路径完全相同时 same 为 true；没有公共后缀时返回 undefined。
+ */
+function branchMapping(sourcePath: string, targetPath: string): BranchMapping | undefined {
+  const source = sourcePath.split('/').filter(Boolean);
+  const target = targetPath.split('/').filter(Boolean);
+  let common = 0;
+  while (common < source.length && common < target.length &&
+         source[source.length - 1 - common] === target[target.length - 1 - common]) {
+    common++;
+  }
+  const join = (segments: string[]) => segments.length > 0 ? `/${segments.join('/')}` : '';
+  const sourcePrefix = join(source.slice(0, source.length - common));
+  const targetPrefix = join(target.slice(0, target.length - common));
+  if (sourcePrefix === targetPrefix) {
+    return { same: true, common, sourcePrefix, targetPrefix };
+  }
+  return common > 0 ? { same: false, common, sourcePrefix, targetPrefix } : undefined;
+}
+
+function ancestorsOf(directory: string): string[] {
+  const result: string[] = [];
+  let current = path.resolve(directory);
+  for (;;) {
+    result.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return result;
+    }
+    current = parent;
+  }
+}
+
+/** 目录存在且受 SVN 版本管理时返回其信息，否则返回 undefined。 */
+async function directoryInfo(directory: string): Promise<Awaited<ReturnType<typeof getSvnTargetInfo>> | undefined> {
+  try {
+    if (!(await fs.stat(directory)).isDirectory()) {
+      return undefined;
+    }
+    const info = await getSvnTargetInfo(directory);
+    return info.kind === 'dir' ? info : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isInsideDirectory(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+function toPosix(relative: string): string {
+  return relative.split(path.sep).filter(Boolean).join('/');
+}
+
+/** 为常见的合并/更新错误补充处理建议。 */
+function mergeErrorMessage(error: unknown): string {
+  const message = errorMessage(error);
+  if (/E195020|mixed-revision/i.test(message)) {
+    return `${message}\n目标工作副本包含多个修订版本，请先对目标目录执行“更新”后再合并。`;
+  }
+  if (/E155015/.test(message)) {
+    return `${message}\n目标工作副本存在未解决的冲突，请先处理后再合并。`;
+  }
+  return message;
 }

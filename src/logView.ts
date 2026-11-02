@@ -345,7 +345,7 @@ function repositoryRevisionUri(
   });
 }
 
-function repositoryUrl(root: string, repositoryPath: string): string {
+export function repositoryUrl(root: string, repositoryPath: string): string {
   const encodedPath = repositoryPath.replace(/^\/+/, '').split('/')
       .map(segment => encodeURIComponent(segment))
       .join('/');

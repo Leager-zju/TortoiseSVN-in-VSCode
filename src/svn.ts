@@ -39,6 +39,7 @@ export interface SvnLogPage {
 export interface SvnTargetInfo {
   url: string;
   repositoryRoot: string;
+  repositoryUuid?: string;
   relativeUrl: string;
   kind: 'file' | 'dir';
   revision?: string;
@@ -247,7 +248,7 @@ export async function getSvnTargetInfo(targetPath: string): Promise<SvnTargetInf
         revision?: string;
         url?: string;
         'relative-url'?: string;
-        repository?: { root?: string };
+        repository?: { root?: string; uuid?: string };
       };
     };
   };
@@ -258,6 +259,7 @@ export async function getSvnTargetInfo(targetPath: string): Promise<SvnTargetInf
   return {
     url: entry.url,
     repositoryRoot: entry.repository.root,
+    repositoryUuid: entry.repository.uuid,
     relativeUrl: entry['relative-url'] ?? '',
     kind: entry.kind === 'dir' ? 'dir' : 'file',
     revision: entry.revision
@@ -420,6 +422,11 @@ export async function getRevisionDiff(filePath: string, revision: number): Promi
   return runSvn(['diff', '-c', String(revision), '--', withPegEscape(filePath)], path.dirname(filePath));
 }
 
+/** svn update：更新整个目录（以该目录为 cwd、“.” 为目标，避免目录名含 “@” 时被解析为 peg 修订）。 */
+export async function updateSvnWorkingCopy(directory: string): Promise<string> {
+  return runSvn(['update', '--non-interactive', '--accept', 'postpone', '--', '.'], directory);
+}
+
 /** svn update -r REV：把工作副本中的单个文件更新到指定修订。 */
 export async function updateSvnToRevision(filePath: string, revision: number): Promise<string> {
   return runSvn(
@@ -457,6 +464,46 @@ export async function reverseMergeSvn(
 
 function withPegEscape(targetPath: string): string {
   return `${targetPath}@`;
+}
+
+export interface SvnMergeChange {
+  /** svn 通知行的状态列，例如 “U   ”、“A   ”、“ U  ”、“C   ”、“   C”。 */
+  status: string;
+  path: string;
+  conflicted: boolean;
+}
+
+/**
+ * svn merge -c REV：把某次提交在 sourceUrl 下的全部改动一次性合并到目标目录，
+ * 只在目标目录记录一条 svn:mergeinfo。以目标目录为 cwd、“.” 为目标，避免目录名含 “@” 时被解析为 peg 修订。
+ */
+export async function mergeSvnRevision(
+  targetDirectory: string,
+  sourceUrl: string,
+  revision: number,
+  dryRun: boolean
+): Promise<string> {
+  return runSvn(
+    ['merge', '-c', String(revision), ...(dryRun ? ['--dry-run'] : []),
+      '--non-interactive', '--accept', 'postpone', '--', `${sourceUrl}@${revision}`, '.'],
+    targetDirectory);
+}
+
+/** 解析 svn merge 的通知输出，返回受影响的路径（忽略 “--- Merging …”、冲突汇总等说明行）。 */
+export function parseSvnMergeOutput(output: string): SvnMergeChange[] {
+  const changes: SvnMergeChange[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^([ADUCGER ])([UCG ])([ L])([ C]) (.+)$/.exec(line);
+    if (!match || line.startsWith('---') || !match.slice(1, 5).some(column => column.trim())) {
+      continue;
+    }
+    changes.push({
+      status: match.slice(1, 5).join(''),
+      path: match[5].trim(),
+      conflicted: match[1] === 'C' || match[2] === 'C' || match[4] === 'C'
+    });
+  }
+  return changes;
 }
 
 export async function getBaseContent(filePath: string): Promise<string> {
