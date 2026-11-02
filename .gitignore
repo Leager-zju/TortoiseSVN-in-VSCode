@@ -1,4 +1,4 @@
 node_modules/
 dist/
-.svn-compass-test-*/
 *.vsix
+.*/
