@@ -2,3 +2,9 @@ node_modules/
 dist/
 *.vsix
 .*/
+!.github/
+.DS_Store
+.env
+*.log
+*.tsbuildinfo
+Thumbs.db
