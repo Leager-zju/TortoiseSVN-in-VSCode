@@ -8,7 +8,7 @@
 
 面向 Windows 与 TortoiseSVN，原生命令驱动，界面与 Git 体验保持一致。
 
-![version](https://img.shields.io/badge/version-0.3.11-blue)
+![version](https://img.shields.io/badge/version-0.3.17-blue)
 ![vscode](https://img.shields.io/badge/VS%20Code-%E2%89%A51.96-007ACC?logo=visualstudiocode)
 ![platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows)
 ![license](https://img.shields.io/badge/license-MIT-green)
@@ -24,7 +24,8 @@
 ### 🗂️ 源代码管理侧栏
 
 - **多工作副本聚合**：多根工作区、工作区内的多个（含嵌套）SVN 工作副本统一显示在一个提供器中。
-- **原生 changelist 分组**：按“默认分组 / 自定义分组”展示可提交项，分组即 SVN 原生 changelist，与 TortoiseSVN 互通；支持新建、重命名、删除分组，以及按分组提交、回退、创建 Patch / Code Review。
+- **原生 changelist 分组**：按“默认分组 / 自定义分组”展示可提交项，分组即 SVN 原生 changelist，与 TortoiseSVN 互通；支持新建、重命名、删除分组，以及按分组更新、提交、回退、创建 Patch / Code Review。
+- **空分组**：在【更改】标题栏「…」菜单中选择 **新建分组** 可创建不含文件的空分组，之后再把文件移入；通过插件移出分组的最后一个文件时分组保留为空。SVN 本身无法记录空 changelist，空分组名保存在当前工作区，有文件移入后即成为原生 changelist；提交或在 TortoiseSVN 等外部工具中清空的分组仍会自动消失。
 - **树状 / 平铺切换**：切换视图不会改变文件所属分组。
 - **遵守排除规则**：`files.exclude` 与 `search.exclude` 中被排除的路径不会出现在侧栏，也不会被分组操作触及。
 
@@ -43,7 +44,7 @@
 
 ### 🔍 Diff、日志与 Blame
 
-- **Diff**：在 VS Code 内置对比编辑器中打开，支持在 Diff 中回退单个差异块。
+- **Diff**：在 VS Code 内置对比编辑器中打开，支持在 Diff 及编辑器行号旁的快速差异窗口中回退单个差异块（回退后窗口关闭、光标留在原处，不会跳到其他差异）；标题栏 **打开文件** 按钮（位于“上一个更改”左侧）可直接打开工作副本文件，并保留当前光标位置与可见区域。
 - **SVN 日志**：独立页面展示完整历史、作者、日期、提交信息及变更路径，支持筛选、分页、查看修订、修订间比较，以及与工作副本当前版本比较。
 - **选中内容历史**：在编辑器中选中一段代码，右键查看逐行 SVN 历史、相关提交与本地未提交行。
 - **Blame**：行号右键开启，逐行显示最后修改的作者与时间，再次点击整篇隐藏；悬停查看修订号、完整时间、提交说明与变更路径。
@@ -63,7 +64,7 @@
 
 | 操作 | 实现方式 |
 |---|---|
-| 更新、提交、加入版本管理、创建 Code Review | TortoiseSVN 原生窗口 |
+| 更新、提交（含按分组更新 / 提交）、加入版本管理、创建 Code Review | TortoiseSVN 原生窗口 |
 | 回退 | VS Code 确认窗口，确认后直接放弃所选改动 |
 | 日志、Diff、Blame、分组、合并等 | `svn.exe` 命令行，结果在 VS Code 内展示 |
 

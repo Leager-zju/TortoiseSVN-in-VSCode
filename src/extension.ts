@@ -96,7 +96,8 @@ class RepositoryManager implements vscode.Disposable {
   constructor(private readonly context: vscode.ExtensionContext) {
     this.sourceControl = new SvnSourceControl(
       context.globalState,
-      vscode.Uri.joinPath(context.globalStorageUri, 'patches')
+      vscode.Uri.joinPath(context.globalStorageUri, 'patches'),
+      context.workspaceState
     );
     context.subscriptions.push(this.output, this.blameAnnotator, this.conflictView, this.fileHistoryView);
   }
@@ -331,11 +332,21 @@ class RepositoryManager implements vscode.Disposable {
           preview: false,
           viewColumn: vscode.ViewColumn.Active
         };
+        // 与 Git 一致：从 Diff 打开时保留光标位置与可见区域（打开新文档后 activeTextEditor 会变化，需先取出）
         const activeEditor = vscode.window.activeTextEditor;
-        if (activeEditor?.document.uri.path === uri.path) {
-          options.selection = activeEditor.selection;
+        const sameFile = activeEditor?.document.uri.path === uri.path;
+        const previousSelection = sameFile ? activeEditor.selection : undefined;
+        const previousVisibleRanges = sameFile ? activeEditor.visibleRanges : [];
+        if (previousSelection) {
+          options.selection = previousSelection;
         }
         await vscode.commands.executeCommand('vscode.open', uri, options);
+        const opened = vscode.window.activeTextEditor;
+        if (opened?.document.uri.toString() === uri.toString() && previousVisibleRanges.length > 0) {
+          const range = previousVisibleRanges.find(visible =>
+            previousSelection && visible.intersection(previousSelection)) ?? previousVisibleRanges[0];
+          opened.revealRange(range);
+        }
       } catch (error) {
         void vscode.window.showErrorMessage(`无法打开工作副本文件：${errorMessage(error)}`);
       }
@@ -401,6 +412,7 @@ class RepositoryManager implements vscode.Disposable {
     register('svn.moveToExistingGroup', (...values) => this.moveToExistingGroup(commandUris(...values)));
     register('svn.renameGroup', group => this.renameGroup(group));
     register('svn.deleteGroup', group => this.deleteGroup(group));
+    register('svn.updateGroup', group => this.runGroupNative('update', group));
     register('svn.commitGroup', group => this.runGroupNative('commit', group));
     register('svn.revertGroup', group => this.revertGroup(group));
     register('svn.createCodeReviewGroup', group => this.runGroupNative('gfcreatecr', group));
@@ -581,6 +593,9 @@ class RepositoryManager implements vscode.Disposable {
       return;
     }
     const documentVersion = document.version;
+    // 在等待用户确认的同时读取 BASE，确认后无需再等待 svn 进程
+    const baseContentPromise = status.item === 'added' ? Promise.resolve('') : getBaseContent(uri.fsPath);
+    baseContentPromise.catch(() => undefined);
     const choice = await vscode.window.showWarningMessage(
       `是否回退“${path.basename(uri.fsPath)}”中的当前差异？其他本地更改将保留。`,
       {modal: true},
@@ -595,8 +610,7 @@ class RepositoryManager implements vscode.Disposable {
     }
 
     try {
-      const baseContent = status.item === 'added' ? '' :
-        await getBaseContent(uri.fsPath);
+      const baseContent = await baseContentPromise;
       if (document.version !== documentVersion || document.isDirty) {
         void vscode.window.showWarningMessage('文件内容已变化，请重新打开快速差异后再回退。');
         return;
@@ -607,6 +621,9 @@ class RepositoryManager implements vscode.Disposable {
       }
       const changeEdit = createRevertChangeEdit(baseContent, document, changes[index]);
       const viewState = captureRevertViewState(editor, changeEdit.range);
+      // 快速差异窗口要等命令结束才关闭；若在此之前文档变化，它会自动跳到下一处差异。
+      // 因此先关闭窗口再编辑。
+      await closeQuickDiff(editor);
       const edit = new vscode.WorkspaceEdit();
       edit.replace(uri, changeEdit.range, changeEdit.text);
       if (!await vscode.workspace.applyEdit(edit)) {
@@ -616,10 +633,12 @@ class RepositoryManager implements vscode.Disposable {
         throw new Error('文件保存失败。');
       }
       restoreRevertViewState(editor, changeEdit.range.start, viewState);
-      await this.refreshAll(true);
     } catch (error) {
       void vscode.window.showErrorMessage(`SVN 差异回退失败：${errorMessage(error)}`);
+      return;
     }
+    // 状态刷新放到后台，避免阻塞编辑器
+    void this.refreshAll(true).catch(error => this.log(`回退差异后刷新失败：${errorMessage(error)}`));
   }
 
   private async confirmAndRevert(uris: vscode.Uri[]): Promise<void> {
@@ -994,14 +1013,11 @@ class RepositoryManager implements vscode.Disposable {
     }
   }
 
+  /** 未选中文件（如从标题栏菜单触发）时创建空分组。 */
   private async moveToNewGroup(uris: vscode.Uri[]): Promise<void> {
-    if (uris.length === 0) {
-      void vscode.window.showWarningMessage('请选择要分组的 SVN 差异文件。');
-      return;
-    }
     const label = await vscode.window.showInputBox({
       title: '新建 SVN 分组',
-      prompt: '输入分组名称',
+      prompt: uris.length === 0 ? '输入分组名称，将创建一个空分组' : '输入分组名称',
       placeHolder: '分组名称',
       ignoreFocusOut: true
     });
@@ -1082,7 +1098,7 @@ class RepositoryManager implements vscode.Disposable {
     }
   }
 
-  private runGroupNative(command: 'commit' | 'gfcreatecr', value: unknown): void {
+  private runGroupNative(command: 'update' | 'commit' | 'gfcreatecr', value: unknown): void {
     const group = this.sourceControl.resourceGroup(value);
     if (!group) {
       return;
@@ -1218,6 +1234,16 @@ type RevertViewState = {
   insideChange: boolean[];
   topLine: number;
 };
+
+/** 关闭该编辑器上的快速差异窗口。closeQuickDiff 作用于获得焦点的编辑器，因此先聚焦。 */
+async function closeQuickDiff(editor: vscode.TextEditor): Promise<void> {
+  try {
+    await vscode.window.showTextDocument(editor.document, { viewColumn: editor.viewColumn, preserveFocus: false });
+    await vscode.commands.executeCommand('closeQuickDiff');
+  } catch {
+    // 窗口未打开或命令不可用时忽略
+  }
+}
 
 function captureRevertViewState(editor: vscode.TextEditor, range: vscode.Range): RevertViewState {
   return {

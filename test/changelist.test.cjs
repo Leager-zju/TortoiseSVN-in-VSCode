@@ -40,6 +40,30 @@ const vscode = {
   ThemeIcon: class {},
   ThemeColor: class {},
   RelativePattern: class {},
+  Position: class {
+    constructor(line, character) { this.line = line; this.character = character; }
+    compareTo(other) { return this.line - other.line || this.character - other.character; }
+    isBeforeOrEqual(other) { return this.compareTo(other) <= 0; }
+    isAfterOrEqual(other) { return this.compareTo(other) >= 0; }
+  },
+  Range: class {
+    constructor(a, b, c, d) {
+      this.start = typeof a === 'number' ? new vscode.Position(a, b) : a;
+      this.end = typeof a === 'number' ? new vscode.Position(c, d) : b;
+    }
+  },
+  Selection: class {
+    constructor(anchor, active) {
+      this.anchor = anchor; this.active = active;
+      [this.start, this.end] = anchor.isBeforeOrEqual(active) ? [anchor, active] : [active, anchor];
+    }
+  },
+  EndOfLine: { LF: 1, CRLF: 2 },
+  TextEditorRevealType: { AtTop: 3 },
+  WorkspaceEdit: class {
+    constructor() { this.edits = []; }
+    replace(uri, range, text) { this.edits.push({ uri, range, text }); }
+  },
   languages: { registerHoverProvider: () => ({ dispose() {} }) },
   commands: {
     executeCommand: async (command, key, value) => {
@@ -242,7 +266,8 @@ test('default group never creates a changelist and moving back only removes an a
     await f.scm.moveResources([f.uri('a.txt')], f.scm.changes);
     assert.equal(nativeGroup(f.root, 'a.txt'), '');
     assert.deepEqual(members(f.scm, '默认分组'), ['a.txt']);
-    assert.equal(f.scm.resourceGroup(group), undefined);
+    assert.equal(f.scm.resourceGroup(group), group);
+    assert.deepEqual(members(f.scm, '自定义'), []);
     assert.equal(writes, 2);
   } finally {
     failCommand = undefined;
@@ -279,6 +304,8 @@ test('create, move, rename and delete update native associations without changin
   assert.deepEqual(members(f.scm, group.label), ['a.txt', 'name@x.txt']);
   const next = await f.scm.createGroup('另一组', [f.uri('a.txt')]);
   await f.scm.moveResources([f.uri('name@x.txt')], next);
+  assert.deepEqual(members(f.scm, group.label), []);
+  await f.scm.deleteGroup(f.scm.findGroupByLabel(group.label));
   assert.equal(f.scm.findGroupByLabel(group.label), undefined);
   await f.scm.renameGroup(next, '重命名');
   assert.deepEqual(members(f.scm, '重命名'), ['a.txt', 'name@x.txt']);
@@ -290,14 +317,53 @@ test('create, move, rename and delete update native associations without changin
   assert.equal(fs.readFileSync(f.uri('a.txt').fsPath, 'utf8'), 'initial\nchanged\n');
 });
 
-test('empty and directory-only creation do not invent native groups', async () => {
+test('directory-only creation does not invent native groups', async () => {
   const f = await fixture();
-  await assert.rejects(f.scm.createGroup('空组', []), /不能创建空分组/);
   svn(f.root, 'propset', 'test-property', 'value', 'dir');
   await refresh(f);
-  await assert.rejects(f.scm.createGroup('目录组', [f.uri('dir')]), /不能创建空分组/);
+  await assert.rejects(f.scm.createGroup('目录组', [f.uri('dir')]), /没有可加入 changelist 的版本化文件/);
   assert.deepEqual(f.scm.groups.map(group => group.label), ['默认分组']);
   assert.equal(nativeGroup(f.root, 'dir/nested.txt'), '');
+});
+
+test('empty groups persist in workspace state and become native once files move in', async () => {
+  const f = await fixture();
+  const workspace = new State();
+  const scm = new SvnSourceControl(f.state, Uri.file(path.join(temporary, 'patches')), workspace);
+  await scm.setRepositories([f.repository]);
+  const empty = await scm.createGroup(' 空组 ', []);
+  assert.equal(empty.label, '空组');
+  assert.deepEqual(scm.groups.map(group => group.label), ['默认分组', '空组']);
+  assert.deepEqual(workspace.data['svn.emptyChangelists.v1'], ['空组']);
+  await assert.rejects(scm.createGroup('空组', []), /已存在/);
+  assert.equal(nativeGroup(f.root, 'a.txt'), '');
+
+  const restored = new SvnSourceControl(f.state, Uri.file(path.join(temporary, 'patches')), workspace);
+  await restored.setRepositories([f.repository]);
+  assert.deepEqual(restored.groups.map(group => group.label), ['默认分组', '空组']);
+  restored.dispose();
+
+  await scm.renameGroup(empty, '空组改名');
+  assert.deepEqual(workspace.data['svn.emptyChangelists.v1'], ['空组改名']);
+  await scm.moveResources([f.uri('a.txt')], scm.findGroupByLabel('空组改名'));
+  assert.equal(nativeGroup(f.root, 'a.txt'), '空组改名');
+  assert.deepEqual(workspace.data['svn.emptyChangelists.v1'], []);
+
+  await scm.moveResources([f.uri('a.txt')], scm.changes);
+  assert.equal(nativeGroup(f.root, 'a.txt'), '');
+  assert.deepEqual(members(scm, '空组改名'), []);
+  assert.deepEqual(workspace.data['svn.emptyChangelists.v1'], ['空组改名']);
+
+  await scm.deleteGroup(scm.findGroupByLabel('空组改名'));
+  assert.deepEqual(scm.groups.map(group => group.label), ['默认分组']);
+  assert.deepEqual(workspace.data['svn.emptyChangelists.v1'], []);
+
+  await scm.createGroup('外部清空', [f.uri('a.txt')]);
+  svn(f.root, 'changelist', '--remove', 'a.txt');
+  await f.repository.refresh();
+  scm.update();
+  assert.equal(scm.findGroupByLabel('外部清空'), undefined);
+  scm.dispose();
 });
 
 test('legacy storage is never read, restored, migrated or written', async () => {
@@ -321,7 +387,7 @@ test('legacy storage is never read, restored, migrated or written', async () => 
   assert.deepEqual(f.state.accesses, ['svn.patches.roots.v1']);
   for (const file of ['scm.ts', 'extension.ts']) {
     const source = fs.readFileSync(path.join(project, 'src', file), 'utf8');
-    assert.doesNotMatch(source, /workspaceState|StoredGroup|persistGroups|migrateLegacyAssignments|svn\.resourceGroups/);
+    assert.doesNotMatch(source, /StoredGroup|persistGroups|migrateLegacyAssignments|svn\.resourceGroups/);
   }
 });
 
@@ -472,7 +538,78 @@ test('native user operations are serialized and retain the last requested associ
   release();
   await Promise.all([creation, removal]);
   assert.equal(nativeGroup(f.root, 'a.txt'), '');
-  assert.equal(f.scm.findGroupByLabel('第一组'), undefined);
+  assert.deepEqual(members(f.scm, '第一组'), []);
+});
+
+test('reverting one quick diff change closes the peek first and does not wait for the refresh', async () => {
+  const f = await fixture();
+  fs.writeFileSync(f.uri('a.txt').fsPath, 'first\ninitial\nchanged\n');
+  await refresh(f);
+  const m = manager();
+  m.repositories.set(f.root, f.repository);
+  await m.sourceControl.setRepositories([f.repository]);
+
+  const uri = f.uri('a.txt');
+  const events = [];
+  let text = fs.readFileSync(uri.fsPath, 'utf8');
+  const lines = () => text.split('\n');
+  const offset = position => lines().slice(0, position.line).reduce((sum, line) => sum + line.length + 1, 0)
+    + position.character;
+  const document = {
+    uri, eol: vscode.EndOfLine.LF, isDirty: false, isClosed: false, version: 1,
+    get lineCount() { return lines().length; },
+    lineAt: line => ({ text: lines()[line], range: { end: new vscode.Position(line, lines()[line].length) } }),
+    getText: () => text,
+    save: async () => { events.push('save'); fs.writeFileSync(uri.fsPath, text); return true; }
+  };
+  const editor = {
+    document, viewColumn: 1,
+    selections: [new vscode.Selection(new vscode.Position(2, 0), new vscode.Position(2, 0))],
+    visibleRanges: [new vscode.Range(0, 0, 3, 0)],
+    revealRange() {}
+  };
+  const savedWindow = { ...vscode.window };
+  const original = { commands: vscode.commands.executeCommand, applyEdit: vscode.workspace.applyEdit };
+  Object.assign(vscode.window, {
+    visibleTextEditors: [editor],
+    showWarningMessage: async (message, options) => {
+      events.push(options?.modal ? 'confirm' : `warning:${message}`);
+      return options?.modal ? '回退此差异' : undefined;
+    },
+    showErrorMessage: async message => { events.push(`error:${message}`); },
+    showTextDocument: async () => { events.push('focus'); return editor; }
+  });
+  vscode.commands.executeCommand = async (command, ...args) => {
+    if (command === 'closeQuickDiff') { events.push('closeQuickDiff'); }
+    return original.commands(command, ...args);
+  };
+  vscode.workspace.applyEdit = async edit => {
+    for (const { range, text: replacement } of edit.edits) {
+      text = text.slice(0, offset(range.start)) + replacement + text.slice(offset(range.end));
+    }
+    document.version++;
+    events.push('applyEdit');
+    return true;
+  };
+  let refreshed = false;
+  m.refreshAll = () => { refreshed = true; return new Promise(() => {}); };
+  try {
+    const changes = [
+      { originalStartLineNumber: 0, originalEndLineNumber: 0, modifiedStartLineNumber: 1, modifiedEndLineNumber: 1 },
+      { originalStartLineNumber: 1, originalEndLineNumber: 0, modifiedStartLineNumber: 3, modifiedEndLineNumber: 3 }
+    ];
+    await m.revertChange(uri, changes, 1);
+    assert.deepEqual(events, ['confirm', 'focus', 'closeQuickDiff', 'applyEdit', 'save']);
+    assert.equal(fs.readFileSync(uri.fsPath, 'utf8'), 'first\ninitial\n');
+    assert.equal(refreshed, true);
+    assert.equal(editor.selections[0].active.line, 2);
+  } finally {
+    Object.keys(vscode.window).forEach(key => delete vscode.window[key]);
+    Object.assign(vscode.window, savedWindow);
+    vscode.commands.executeCommand = original.commands;
+    vscode.workspace.applyEdit = original.applyEdit;
+    m.dispose?.();
+  }
 });
 
 test('large status queries and changelist writes stay below Windows argument limits', async () => {
@@ -904,7 +1041,7 @@ test('local writes recheck exclusions and do not touch newly hidden targets', as
     await f.scm.moveResources([f.uri('a.txt')], f.scm.changes);
     assert.equal(nativeGroup(f.root, 'a.txt'), group.label);
     assert.equal(f.scm.statusFor(f.uri('a.txt')), undefined);
-    assert.equal(f.scm.findGroupByLabel(group.label), undefined);
+    assert.deepEqual(members(f.scm, group.label), []);
   } finally {
     configurationProvider = undefined;
   }

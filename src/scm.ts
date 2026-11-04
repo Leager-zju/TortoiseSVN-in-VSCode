@@ -18,6 +18,7 @@ type IndexedStatus = {
 const DEFAULT_GROUP_ID = 'changes';
 const DEFAULT_GROUP_LABEL = '默认分组';
 const PATCH_ROOTS_STORAGE_KEY = 'svn.patches.roots.v1';
+const EMPTY_GROUPS_STORAGE_KEY = 'svn.emptyChangelists.v1';
 const PATCH_VIEW_ID = 'svn.patchView';
 
 export class SvnRepository {
@@ -198,14 +199,18 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
   private patchItems: PatchTreeItem[] = [];
   private repositories: SvnRepository[] = [];
   private statuses = new Map<string, IndexedStatus>();
+  /** 没有任何原生成员的分组名。SVN 无法表示空 changelist，因此由插件单独保存。 */
+  private readonly emptyGroups: Set<string>;
 
   constructor(
     private readonly patchState: vscode.Memento,
-    patchDirectory: vscode.Uri
+    patchDirectory: vscode.Uri,
+    private readonly emptyGroupState?: vscode.Memento
   ) {
     this.patchDirectory = patchDirectory;
     this.patchRoots = new Map(Object.entries(
       sanitizePatchRoots(patchState.get<StoredPatchRoots>(PATCH_ROOTS_STORAGE_KEY))));
+    this.emptyGroups = new Set(sanitizeGroupNames(emptyGroupState?.get<unknown>(EMPTY_GROUPS_STORAGE_KEY)));
     this.sourceControl = vscode.scm.createSourceControl('svn', '更改');
     this.changes = this.sourceControl.createResourceGroup(DEFAULT_GROUP_ID, DEFAULT_GROUP_LABEL);
     this.resourceGroups.set(DEFAULT_GROUP_ID, this.changes);
@@ -226,6 +231,7 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
       treeDataProvider: this,
       showCollapseAll: false
     });
+    this.updateResourceGroups();
   }
 
   get statusEntries(): readonly SvnStatusEntry[] {
@@ -349,13 +355,20 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
     return group.resourceStates.map(state => state.resourceUri.fsPath);
   }
 
+  /** 不传文件时创建空分组；传入文件但其中没有可分组的版本化文件时报错。 */
   createGroup(label: string, uris: readonly vscode.Uri[]): Promise<vscode.SourceControlResourceGroup> {
     return this.enqueueGroupOperation(async () => {
       const normalized = this.validatedGroupLabel(label);
-      await this.applyChangelist(this.relatedChanges(uris), normalized);
+      if (uris.length === 0) {
+        this.emptyGroups.add(normalized);
+        this.update();
+        await this.persistEmptyGroups();
+      } else {
+        await this.applyChangelist(this.relatedChanges(uris), normalized);
+      }
       const group = this.changelistGroups.get(normalized);
       if (!group) {
-        throw new Error('没有可加入 changelist 的版本化文件，不能创建空分组。');
+        throw new Error('所选内容中没有可加入 changelist 的版本化文件。');
       }
       return group;
     });
@@ -368,8 +381,17 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
         throw new Error('请选择一个现有 SVN changelist，默认分组不能重命名。');
       }
       const next = this.validatedGroupLabel(label, group.id);
-      if (next !== current) {
+      if (next === current) {
+        return;
+      }
+      if (this.emptyGroups.delete(current)) {
+        this.emptyGroups.add(next);
+        await this.persistEmptyGroups();
+      }
+      if (this.nativeChangelistNames().has(current)) {
         await this.reassignChangelist(current, next);
+      } else {
+        this.update();
       }
     });
   }
@@ -380,7 +402,14 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
       if (current === undefined) {
         throw new Error('请选择一个现有 SVN changelist，默认分组不能删除。');
       }
-      await this.reassignChangelist(current, undefined);
+      if (this.emptyGroups.delete(current)) {
+        await this.persistEmptyGroups();
+      }
+      if (this.nativeChangelistNames().has(current)) {
+        await this.reassignChangelist(current, undefined);
+      } else {
+        this.update();
+      }
     });
   }
 
@@ -442,11 +471,16 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
         isSameOrParentPath(selected, indexed.entry.path)));
   }
 
+  /** 通过插件移出最后一个成员的分组保留为空分组；外部（提交、TortoiseSVN）清空的分组仍会消失。 */
   private async applyChangelist(items: readonly IndexedStatus[], changelist: string | undefined): Promise<void> {
     const byRepository = new Map<SvnRepository, SvnStatusEntry[]>();
+    const sources = new Set<string>();
     for (const { entry, repository } of items) {
       if (repository.ready && entry.changelist === changelist) {
         continue;
+      }
+      if (entry.changelist && entry.changelist !== changelist) {
+        sources.add(entry.changelist);
       }
       const entries = byRepository.get(repository) ?? [];
       entries.push(entry);
@@ -460,8 +494,26 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
         }
       }
     } finally {
+      const native = this.nativeChangelistNames();
+      const emptied = [...sources].filter(name => !native.has(name) && !this.emptyGroups.has(name));
+      emptied.forEach(name => this.emptyGroups.add(name));
       this.update();
+      if (emptied.length > 0) {
+        await this.persistEmptyGroups();
+      }
     }
+  }
+
+  private nativeChangelistNames(): Set<string> {
+    const names = new Set<string>();
+    for (const repository of this.repositories) {
+      for (const entry of repository.statusEntries) {
+        if (entry.changelist) {
+          names.add(entry.changelist);
+        }
+      }
+    }
+    return names;
   }
 
   private async reassignChangelist(from: string, to: string | undefined): Promise<void> {
@@ -511,6 +563,19 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
         this.groupIdForChangelist(entry.changelist);
       }
     }
+    let promoted = false;
+    for (const name of this.emptyGroups) {
+      if (names.has(name)) {
+        this.emptyGroups.delete(name);
+        promoted = true;
+      } else {
+        names.add(name);
+        this.groupIdForChangelist(name);
+      }
+    }
+    if (promoted) {
+      void this.persistEmptyGroups();
+    }
     const entries = this.statusEntries
       .filter(isVersionedChange)
       .sort((left, right) => left.path.localeCompare(right.path));
@@ -558,6 +623,10 @@ export class SvnSourceControl implements vscode.Disposable, vscode.FileDecoratio
       PATCH_ROOTS_STORAGE_KEY,
       Object.fromEntries(this.patchRoots) satisfies StoredPatchRoots
     );
+  }
+
+  private async persistEmptyGroups(): Promise<void> {
+    await this.emptyGroupState?.update(EMPTY_GROUPS_STORAGE_KEY, [...this.emptyGroups]);
   }
 
   private toResourceState(entry: SvnStatusEntry): vscode.SourceControlResourceState {
@@ -613,6 +682,13 @@ function sanitizePatchRoots(value: unknown): StoredPatchRoots {
     }
   }
   return roots;
+}
+
+function sanitizeGroupNames(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((name): name is string => typeof name === 'string' && name.trim() === name && name !== '');
 }
 
 function isPatchFile(fileName: string): boolean {
